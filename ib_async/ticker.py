@@ -436,6 +436,33 @@ class Tickfilter(Op):
         """
         return VolumeBars(volume, self)
 
+    def valuebars(self, size: int, multiplier: int = 1) -> "ValueBars":
+        """
+        Aggregate ticks into bars that have the same cost measured in price * volume.
+        Emits a completed :class:`Bar`.
+
+        This event stores a :class:`BarList` of all created bars in the
+        ``bars`` property.
+
+        Args:
+            size: Size in cost (price * volume * multiplier) to use to form one bar.
+            muliplier: Cost multiplier of one underlying.
+        """
+        return ValueBars(size, multiplier, self)
+
+    def rangebars(self, basis_points_range: float) -> "RangeBars":
+        """
+        Aggregate ticks into bars that have the same size measured in basis points of the open price.
+        Emits a completed :class:`Bar`.
+
+        This event stores a :class:`BarList` of all created bars in the
+        ``bars`` property.
+
+        Args:
+            basis_points_range: Size in basis points to use to form one bar.
+        """
+        return RangeBars(basis_points_range, self)
+
 
 class Midpoints(Tickfilter):
     __slots__ = ()
@@ -562,11 +589,96 @@ class VolumeBars(Op):
             self.bars.append(bar)
         else:
             bar = self.bars[-1]
-            bar.high = max(bar.high, price)
-            bar.low = min(bar.low, price)
+            if bar.high is not None:
+                bar.high = max(bar.high, price)
+            else:
+                bar.high = price
+            if bar.low is not None:
+                bar.low = min(bar.low, price)
+            else:
+                bar.low = price
             bar.close = price
             bar.volume += size
             bar.count += 1
         if bar.volume >= self._volume:
             self.bars.updateEvent.emit(self.bars, True)
             self.emit(self.bars)
+
+
+class ValueBars(Op):
+    __slots__ = ("_multiplier", "_size", "bars")
+    __doc__ = Tickfilter.valuebars.__doc__
+
+    bars: BarList
+
+    def __init__(self, size, multiplier, source=None):
+        Op.__init__(self, source)
+        self._size = size
+        self._multiplier = multiplier
+        self.bars = BarList()
+
+    def on_source(self, time, price, size):
+        if not self.bars or self.bars[-1].volume >= self._size:
+            bar = Bar(time, price, price, price, price, size * price * self._multiplier, 1)
+            self.bars.append(bar)
+        else:
+            bar = self.bars[-1]
+            if bar.high is not None:
+                bar.high = max(bar.high, price)
+            else:
+                bar.high = price
+            if bar.low is not None:
+                bar.low = min(bar.low, price)
+            else:
+                bar.low = price
+            bar.close = price
+            bar.volume += size * price * self._multiplier
+            bar.count += 1
+        if bar.volume >= self._size:
+            self.bars.updateEvent.emit(self.bars, True)
+            self.emit(self.bars)
+        else:
+            self.bars.updateEvent.emit(self.bars, False)
+
+class RangeBars(Op):
+    __slots__ = ("_basis_point_range", "_max_bar_size", "bars")
+    __doc__ = Tickfilter.rangebars.__doc__
+
+    bars: BarList
+
+    def __init__(self, basis_points_range, source=None):
+        Op.__init__(self, source)
+        self._basis_point_range = basis_points_range
+        self._max_bar_size: float = 0.0
+        self.bars = BarList()
+
+    def on_source(self, time, price, size):
+        bar_size = 0.0
+        if not self.bars or self._max_bar_size == 0.0:
+            if self._max_bar_size == 0.0:
+                self._max_bar_size = (price * self._basis_point_range) / 10000.0
+            bar = Bar(time, price, price, price, price, size, 1)
+            self.bars.append(bar)
+        else:
+            bar = self.bars[-1]
+            if bar.high is not None:
+                bar.high = max(bar.high, price)
+            else:
+                bar.high = price
+            if bar.low is not None:
+                bar.low = min(bar.low, price)
+            else:
+                bar.low = price
+            if bar.high is not None and bar.low is not None:
+                bar_size = bar.high - bar.low
+            else:
+                bar_size = 0
+            bar.close = price
+            bar.volume += size
+            bar.count += 1
+        if bar_size > self._max_bar_size:
+            self._max_bar_size = 0.0
+            self.bars.updateEvent.emit(self.bars, True)
+            self.emit(self.bars)
+        else:
+            self.bars.updateEvent.emit(self.bars, False)

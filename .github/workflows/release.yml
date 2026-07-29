@@ -1,0 +1,74 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers the workflow whenever you push a version tag like v1.0.0
+
+# Protobuf bindings under ib_async/_pb/ are gitignored — generated
+# at build/dev/CI time. The version + SHA256 of IBKR's TWS API
+# archive are pinned in pyproject.toml [tool.ib_async.twsapi].
+# scripts/generate_protos.py fetches that exact archive (cached
+# under ~/.cache/ib_async/twsapi-{version}/), SHA-verifies, extracts
+# the protos + the parity audit's reference client_utils.py, and
+# runs protoc. The same script powers local dev, CI, and the
+# release pipeline so all three operate on identical bytes.
+
+jobs:
+  release:
+    name: release-uv (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Crucial permission required to create and upload to a GitHub Release
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv toolchain
+        run: |
+          pip install pip uv setuptools wheel -U
+
+      - name: Install dependencies with uv
+        run: |
+          uv sync --group dev
+
+      - name: Read TWS API version pin
+        id: twsapi
+        shell: bash
+        run: |
+          v=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["tool"]["ib_async"]["twsapi"]["version"])')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Cache TWS API archive
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ib_async/twsapi-${{ steps.twsapi.outputs.version }}
+          key: twsapi-${{ steps.twsapi.outputs.version }}
+
+      - name: Build wheel + sdist with bundled protos
+        run: |
+          uv sync --group dev
+          make release
+
+      - name: Clean-venv install + import smoke test
+        run: |
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/pip install --upgrade pip
+          /tmp/smoke-venv/bin/pip install dist/*.whl
+          /tmp/smoke-venv/bin/python -c "import ib_async; ib_async.IB(); print('smoke ok')"
+
+      - name: Create GitHub Release and Upload Artifacts
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/* # Instructs the runner to attach all files in the dist directory to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Provided automatically by GitHub Actions
