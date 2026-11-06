@@ -1,18 +1,4 @@
-import pytest
+from __future__ import annotations
 
-import ib_async as ibi
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = ibi.util.getLoop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="session")
-async def ib():
-    ib = ibi.IB()
-    await ib.connectAsync()
-    yield ib
-    ib.disconnect()
+# How tests get event loops, and the check that no test drops a failure.
+pytest_plugins = ["tests._loops"]

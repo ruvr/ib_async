@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
-import functools
+import math
+import sys
 import warnings
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, tzinfo
 from datetime import date as date_
 from decimal import Decimal
-from typing import Any
+from typing import ClassVar, Generic, Protocol, TypeGuard, overload
 
 from eventkit import Event
 
 from ._proto.safe import safe_decimal
 from .contract import Contract, ScanData, TagValue
-from .util import EPOCH
+from .util import EPOCH, dataclassRepr
+
+if sys.version_info >= (3, 13):
+    from typing import TypeVar
+else:
+    from typing_extensions import TypeVar
+
+#: The type of the user's empty values (see :class:`IBDefaults`) that are
+#: not numbers. None by default, as for IBKR's -1 and 0 and for None.
+EmptyT = TypeVar("EmptyT", default=None)
 
 
 @dataclass
@@ -90,64 +100,89 @@ class Execution:
     # preserves the unset semantics across user code that gates on the field.
     optExerciseOrLapseType: int = -1
 
+    # One display policy for the whole order plane (``ib_async/util.py``).
+    # The generated repr printed ``evRule=''``, ``evMultiplier=None`` and
+    # ``modelCode=''`` on every single execution; ``dataclass`` never
+    # overwrites a ``__repr__`` the class body already defines.
+    __repr__ = dataclassRepr
+    __str__ = dataclassRepr
+
+
+V = TypeVar("V")
+
+
+class _HasCommissionAndFees(Protocol[V]):
+    """A class with a ``commissionAndFees`` field of type ``V``."""
+
+    commissionAndFees: V
+
+
+class _CommissionAlias(Generic[V]):
+    """The ``commission`` attribute, which was the v2.x name of
+    ``commissionAndFees``.
+
+    Reading or setting ``commission`` emits a ``DeprecationWarning`` and
+    reads or sets ``commissionAndFees``. The alias is declared in a class
+    body as a ``ClassVar``, so it is not a dataclass field. The
+    constructor and ``dataclasses.replace`` take only
+    ``commissionAndFees``. ``V`` is the type of the field in the class
+    that declares the alias. The alias is to be removed in v4.0."""
+
+    @overload
+    def __get__(
+        self, obj: None, objtype: type[_HasCommissionAndFees[V]] | None = None
+    ) -> _CommissionAlias[V]: ...
+
+    @overload
+    def __get__(
+        self,
+        obj: _HasCommissionAndFees[V],
+        objtype: type[_HasCommissionAndFees[V]] | None = None,
+    ) -> V: ...
+
+    def __get__(
+        self,
+        obj: _HasCommissionAndFees[V] | None,
+        objtype: type[_HasCommissionAndFees[V]] | None = None,
+    ) -> _CommissionAlias[V] | V:
+        if obj is None:
+            return self
+        self._warn(obj)
+        return obj.commissionAndFees
+
+    def __set__(self, obj: _HasCommissionAndFees[V], value: V) -> None:
+        self._warn(obj)
+        obj.commissionAndFees = value
+
+    @staticmethod
+    def _warn(obj: _HasCommissionAndFees[V]) -> None:
+        warnings.warn(
+            f"{type(obj).__name__}.commission is deprecated; use "
+            "commissionAndFees instead. It will be removed in v4.0.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
 
 @dataclass
 class CommissionReport:
     execId: str = ""
-    # IBKR's reference client renamed ``commission`` → ``commissionAndFees``
+    # IBKR renamed ``commission`` → ``commissionAndFees``
     # to match the wire field name (the combined number IBKR returns
     # includes exchange + regulatory fees in addition to the broker commission).
-    # ``commissionAndFees`` is the canonical name in v3.0+. The legacy
-    # ``commission`` attribute and constructor kwarg remain available via the
-    # deprecation alias installed below; both emit ``DeprecationWarning`` and
-    # are slated for removal in v4.0.
+    # ``commissionAndFees`` is the canonical name in v3.0+; ``commission``
+    # (below the fields) is its deprecated v2.x name, until v4.0.
     commissionAndFees: Decimal | None = None
     currency: str = ""
     realizedPNL: Decimal | None = None
     yield_: Decimal | None = None
     yieldRedemptionDate: int = 0
 
+    commission: ClassVar[_CommissionAlias[Decimal | None]] = _CommissionAlias()
 
-# ``commission`` deprecation alias — installed at module load so users
-# upgrading from v2.x continue to see ``report.commission`` work (with a
-# warning) and ``CommissionReport(commission=...)`` continue to accept the
-# old keyword (with a warning). Removal target: v4.0.
-def _install_commission_alias(cls: type, *, legacy_attr: str = "commission") -> None:
-    canonical = "commissionAndFees"
-    deprecation_message = (
-        f"{cls.__name__}.{legacy_attr} is deprecated; use {canonical} instead. "
-        f"It will be removed in v4.0."
-    )
-
-    def _legacy_get(self):  # type: ignore[no-untyped-def]
-        warnings.warn(deprecation_message, DeprecationWarning, stacklevel=2)
-        return getattr(self, canonical)
-
-    def _legacy_set(self, value):  # type: ignore[no-untyped-def]
-        warnings.warn(deprecation_message, DeprecationWarning, stacklevel=2)
-        setattr(self, canonical, value)
-
-    setattr(cls, legacy_attr, property(_legacy_get, _legacy_set))
-
-    orig_init = cls.__init__  # type: ignore[misc]
-
-    @functools.wraps(orig_init)
-    def _patched_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        legacy_value = kwargs.pop(legacy_attr, None)
-        if legacy_value is not None:
-            warnings.warn(
-                f"{cls.__name__}({legacy_attr}=...) is deprecated; "
-                f"use {canonical}= instead. It will be removed in v4.0.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            kwargs.setdefault(canonical, legacy_value)
-        orig_init(self, *args, **kwargs)
-
-    cls.__init__ = _patched_init  # type: ignore[method-assign,misc]
-
-
-_install_commission_alias(CommissionReport)
+    # Same display policy as ``Execution`` above.
+    __repr__ = dataclassRepr
+    __str__ = dataclassRepr
 
 
 @dataclass
@@ -179,10 +214,10 @@ class BarData:
     barCount: int = 0
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class RealTimeBar:
     time: datetime = EPOCH
-    open_: Decimal | None = None
+    open: Decimal | None = None
     high: Decimal | None = None
     low: Decimal | None = None
     close: Decimal | None = None
@@ -212,7 +247,7 @@ class TickAttribLast:
 
 @dataclass
 class HistogramData:
-    # ``size`` is the wire-name in IBKR's reference (gate >=130).
+    # ``size`` is the wire-name (gate >=130).
     # Earlier ib_async releases coerced this to an integer ``count``,
     # which silently truncated fractional sizes that legitimately ship
     # for crypto / FRACTIONAL_SIZE_SUPPORT (gate 163) instruments.
@@ -252,6 +287,11 @@ class TradeLogEntry:
     status: str = ""
     message: str = ""
     errorCode: int = 0
+
+    # Same display policy as ``Execution`` above: a log entry with no
+    # message and no error code prints its time and status only.
+    __repr__ = dataclassRepr
+    __str__ = dataclassRepr
 
 
 @dataclass
@@ -439,6 +479,14 @@ MONETARY_ACCOUNT_VALUE_TAGS: frozenset[str] = frozenset(
     }
 )
 
+# TWS API 10.47 added an API setting — on by default for new installs,
+# off for upgrades — that prefixes per-currency account values with
+# ``$LEDGER-`` so they stop colliding with the account-level value of
+# the same tag (``AccruedCash`` vs ``$LEDGER-AccruedCash`` in USD).
+# ``AccountValue.tag`` keeps the prefix so the two stay distinguishable;
+# only the monetary classification looks past it.
+LEDGER_TAG_PREFIX: str = "$LEDGER-"
+
 
 @dataclass(slots=True, frozen=True)
 class AccountValue:
@@ -461,29 +509,31 @@ class AccountValue:
         site (``decoder.parse``, ``_proto/*`` converters); a divergent
         ad-hoc parse here previously surfaced a fake 1.8e308 / 2.1B
         ``NetLiquidation`` whenever IBKR shipped the unset sentinel.
+        A ``$LEDGER-`` per-currency tag classifies like its bare tag.
         Never raises.
         """
-        if self.tag not in MONETARY_ACCOUNT_VALUE_TAGS:
+        if self.tag.removeprefix(LEDGER_TAG_PREFIX) not in MONETARY_ACCOUNT_VALUE_TAGS:
             return None
         return safe_decimal(self.value)
 
 
-# Tick / bar / depth records — slotted frozen dataclasses for v3.0.
-# Numeric ``price`` / ``size`` fields stay ``float`` here pending the
-# Ticker hot-path benchmark in the same phase. Migrating these to
-# ``Decimal | None`` is coherent with the framework-wide direction but
-# coupled to ``Ticker``'s field types (these tick records are stored
-# verbatim onto ``ticker.ticks`` / ``ticker.tickByTicks`` lists, so the
-# inner type tracks Ticker exactly). The dataclass-shape change here is
-# structural only and adds slots for per-record memory savings.
+# Tick and depth records. These are slotted frozen dataclasses. The
+# numeric ``price`` and ``size`` fields are ``float``; the per-tick path
+# uses float for speed. ``TickData`` and ``TickByTickAllLast`` also hold
+# the empty values of :class:`IBDefaults` for a side or trade with no
+# quote, as ``Ticker`` does, so they are generic over its ``EmptyT``.
+# ``TickData.price`` is None for a size tick on a side that has no price
+# yet. ``Ticker.bid`` is None in the same case.
 
 
 @dataclass(slots=True, frozen=True)
-class TickData:
+class TickData(Generic[EmptyT]):
     time: datetime
     tickType: int
-    price: float
-    size: float
+    # The empty values for a side with no quote; None for a size tick on a
+    # side that has no price yet.
+    price: float | EmptyT | None
+    size: float | EmptyT
 
 
 @dataclass(slots=True, frozen=True)
@@ -514,11 +564,12 @@ class HistoricalTickLast:
 
 
 @dataclass(slots=True, frozen=True)
-class TickByTickAllLast:
+class TickByTickAllLast(Generic[EmptyT]):
     tickType: int
     time: datetime
-    price: float
-    size: float
+    # The empty values for a trade IBKR sends as price -1 and size 0.
+    price: float | EmptyT
+    size: float | EmptyT
     tickAttribLast: TickAttribLast
     exchange: str
     specialConditions: str
@@ -582,6 +633,8 @@ class Position:
     contract: Contract
     position: Decimal | None = None
     avgCost: Decimal | None = None
+    # the model the position belongs to, from reqPositionsMulti; "" otherwise
+    modelCode: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -590,6 +643,11 @@ class Fill:
     execution: Execution
     commissionReport: CommissionReport
     time: datetime
+
+    # Same display policy as ``Execution`` above; the three nested objects
+    # render through their own culled reprs.
+    __repr__ = dataclassRepr
+    __str__ = dataclassRepr
 
 
 @dataclass(slots=True, frozen=True)
@@ -665,7 +723,7 @@ class OptionComputation:
             undPrice=self.undPrice,
         )
 
-    def __mul__(self, other: int | float) -> OptionComputation:
+    def __mul__(self, other: float) -> OptionComputation:
         if not isinstance(other, int | float):
             raise TypeError(f"Cannot multiply {type(self)} and {type(other)}")
 
@@ -689,6 +747,21 @@ class OptionChain:
     multiplier: str
     expirations: list[str]
     strikes: list[float]
+
+
+@dataclass(slots=True, frozen=True)
+class OptionStrikes:
+    """The strikes listed for one expiration of one trading class, from
+    :meth:`IB.reqOptionStrikes`. Unlike an :class:`OptionChain`, whose
+    strikes are those of all its expirations together, every strike here
+    exists for this expiration."""
+
+    expiration: str  # YYYYMMDD, as Contract.lastTradeDateOrContractMonth
+    tradingClass: str
+    multiplier: Decimal | None  # None when IBKR gives none
+    # The contract the options are on, such as one futures month.
+    underlyingConId: int
+    strikes: tuple[float, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -754,6 +827,23 @@ class ConnectionStats:
     numMsgSent: int
 
 
+@dataclass(slots=True, frozen=True)
+class TimedOutRequest:
+    """A request whose time limit passed before IBKR answered it, as
+    ``IB.requestTimeoutEvent`` emits it. The call returned its usual result
+    for a timeout (an empty one, or None)."""
+
+    #: The IB method, such as "reqHistoricalDataAsync", or for a request
+    #: connect makes at startup, what it fetches, such as "positions".
+    name: str
+    #: The time limit, in seconds.
+    timeout: float
+    #: The request's reqId; None for one IBKR answers without a reqId.
+    reqId: int | None = None
+    #: The contract the request is about, if any.
+    contract: Contract | None = None
+
+
 class BarDataList(list[BarData]):
     """
     List of :class:`.BarData` that also stores all request parameters.
@@ -782,6 +872,14 @@ class BarDataList(list[BarData]):
     def __eq__(self, other) -> bool:
         return self is other
 
+    def __ne__(self, other) -> bool:
+        return self is not other
+
+    # Identity-hashable to match the identity equality above (list itself
+    # is unhashable, hence the override).
+    def __hash__(self) -> int:  # type: ignore[override]
+        return id(self)
+
 
 class RealTimeBarList(list[RealTimeBar]):
     """
@@ -807,6 +905,14 @@ class RealTimeBarList(list[RealTimeBar]):
     def __eq__(self, other) -> bool:
         return self is other
 
+    def __ne__(self, other) -> bool:
+        return self is not other
+
+    # Identity-hashable to match the identity equality above (list itself
+    # is unhashable, hence the override).
+    def __hash__(self) -> int:  # type: ignore[override]
+        return id(self)
+
 
 class ScanDataList(list[ScanData]):
     """
@@ -825,8 +931,16 @@ class ScanDataList(list[ScanData]):
         super().__init__(*args)
         self.updateEvent = Event("updateEvent")
 
-    def __eq__(self, other):
+    def __eq__(self, other) -> bool:
         return self is other
+
+    def __ne__(self, other) -> bool:
+        return self is not other
+
+    # Identity-hashable to match the identity equality above (list itself
+    # is unhashable, hence the override).
+    def __hash__(self) -> int:  # type: ignore[override]
+        return id(self)
 
 
 class DynamicObject:
@@ -839,26 +953,50 @@ class DynamicObject:
         return f"{clsName}({kwargs})"
 
 
-class FundamentalRatios(DynamicObject):
+def _isFinite(value: float | EmptyT | None) -> TypeGuard[float]:
+    """Whether ``value`` is a finite int or float (not a bool)."""
+    return (
+        isinstance(value, float | int)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class IBDefaults(Generic[EmptyT]):
+    """The values market data shows where IBKR has no number.
+
+    IBKR marks a quote side with no orders by a price of -1 and a size of
+    0. ``emptyPrice`` and ``emptySize`` are what a Ticker, its tick log
+    and its tick-by-tick log show instead. ``unset`` is the value of each
+    numeric Ticker field before its first tick. ``timezone`` is the zone
+    of the times in tick and log records; orders and requests do not use
+    it.
+
+    Each empty value can be any value the user reads as "no number": a
+    number (the -1 and 0 IBKR sends, NaN), None, an enum member or any
+    other sentinel. ``EmptyT`` is the type of the values that are not
+    numbers; a Ticker's numeric fields are typed ``float | EmptyT | None``.
+    ``IBDefaults(emptyPrice=Missing.PRICE, emptySize=Missing.SIZE)`` makes
+    an ``IBDefaults[Missing]``, and the IB built from it an
+    ``IB[Missing]``.
+
+    ib_async itself reads a value as a number only through
+    :meth:`isPrice` and :meth:`isSize`, so an empty value never reaches
+    its arithmetic or comparisons.
     """
-    See:
-    https://web.archive.org/web/20200725010343/https://interactivebrokers.github.io/tws-api/fundamental_ratios_tags.html
-    """
 
-    pass
-
-
-@dataclass
-class IBDefaults:
-    """A simple way to provide default values when populating API data."""
-
-    # optionally replace IBKR using -1 price and 0 size when quotes don't exist
-    emptyPrice: Any = -1
-    emptySize: Any = 0
-
-    # optionally replace ib_async default for all instance variable values before populated from API updates
-    # Note: None is the universal unset sentinel. Legacy code may compare against this using ==
-    unset: Any = None
-
-    # optionally change the timezone used for log history events in objects (no impact on orders or data processing)
+    emptyPrice: float | EmptyT = -1
+    emptySize: float | EmptyT = 0
+    unset: float | EmptyT | None = None
     timezone: tzinfo = UTC
+
+    def isPrice(self, value: float | EmptyT | None) -> TypeGuard[float]:
+        """Whether ``value`` is a price: a finite number that is neither
+        ``emptyPrice`` nor ``unset``."""
+        return _isFinite(value) and value not in (self.emptyPrice, self.unset)
+
+    def isSize(self, value: float | EmptyT | None) -> TypeGuard[float]:
+        """Whether ``value`` is a size: a finite number that is neither
+        ``emptySize`` nor ``unset``."""
+        return _isFinite(value) and value not in (self.emptySize, self.unset)

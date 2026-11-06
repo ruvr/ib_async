@@ -6,12 +6,15 @@ add/lookup/close lifecycle, and Wrapper holds a fresh instance after
 paths to use it.
 """
 
+from __future__ import annotations
+
 from unittest.mock import MagicMock
 
 import pytest
 
 import ib_async as ibi
 from ib_async._subscriptions import (
+    HistoricalBarsSub,
     MktDataSub,
     MktDepthSub,
     PnLSingleSub,
@@ -246,6 +249,140 @@ def test_close_does_not_set_done_on_shared_ticker():
     assert ticker.updateEvent.done() is False
 
 
+# ---- registration for a send -----------------------------------------------
+
+
+def test_a_subscription_whose_send_raises_is_unregistered():
+    """The encoder refused the request, so nothing was sent: no index keeps
+    the subscription, no cancel goes out, and the shared Ticker stays live."""
+    reg, client = _registry_with_mock_client()
+    contract = _stock(1)
+    ticker = _ticker(contract)
+    sub = MktDataSub(reqId=80, contract=contract, ticker=ticker)
+
+    with pytest.raises(TypeError, match="rejected"), reg.sending(sub):
+        raise TypeError("rejected")
+
+    assert sub.closed is True
+    assert reg.get_sub(80) is None
+    assert reg.get_ticker(80) is None
+    assert reg.find_market_data(1, "mktData") is None
+    assert len(reg) == 0
+    client.cancelMktData.assert_not_called()
+    assert ticker.updateEvent.done() is False
+
+
+def test_a_pooled_ticker_no_stream_was_sent_for_leaves_the_pool():
+    """The send that raised was the only one for the Ticker: it never
+    subscribed, so it is not left in the pool (``ib.tickers()``)."""
+    ib = ibi.IB()
+    reg = ib.wrapper.subscriptions
+    contract = _stock(1)
+    ticker = reg.get_or_create_ticker(contract)
+
+    with (
+        pytest.raises(TypeError),
+        reg.sending(MktDataSub(reqId=86, contract=contract, ticker=ticker)),
+    ):
+        raise TypeError("rejected")
+
+    assert reg.pooled_tickers() == []
+    assert reg.ticker_for_contract(contract) is None
+
+
+def test_a_pooled_ticker_a_stream_was_sent_for_stays_in_the_pool():
+    """A Ticker that served a stream keeps its place, and its identity for
+    a caller holding it, when a later send for it raises."""
+    ib = ibi.IB()
+    ib.client = MagicMock()
+    reg = ib.wrapper.subscriptions
+    contract = _stock(1)
+    ticker = reg.get_or_create_ticker(contract)
+    served = MktDataSub(reqId=87, contract=contract, ticker=ticker)
+    with reg.sending(served):
+        pass
+    served.close()
+
+    with (
+        pytest.raises(TypeError),
+        reg.sending(
+            TickByTickSub(reqId=88, contract=contract, ticker=ticker, tickType="Last")
+        ),
+    ):
+        raise TypeError("rejected")
+
+    assert reg.pooled_tickers() == [ticker]
+
+
+def test_a_pnl_subscription_whose_send_raises_is_unregistered():
+    reg, client = _registry_with_mock_client()
+    pnl = PnLSub(
+        reqId=81,
+        contract=ibi.Contract(),
+        pnl=PnL("DU1", ""),
+        account="DU1",
+        modelCode="",
+    )
+    single = PnLSingleSub(
+        reqId=82,
+        contract=_stock(9),
+        pnlSingle=PnLSingle("DU1", "", 9),
+        account="DU1",
+        modelCode="",
+        conId=9,
+    )
+
+    for sub in (pnl, single):
+        with pytest.raises(TypeError), reg.sending(sub):
+            raise TypeError("rejected")
+
+    assert reg.get_pnl("DU1", "") is None
+    assert reg.get_pnl_single("DU1", "", 9) is None
+    assert len(reg) == 0
+    client.cancelPnL.assert_not_called()
+    client.cancelPnLSingle.assert_not_called()
+
+
+def test_a_subscription_whose_send_returns_stays_registered():
+    reg, _ = _registry_with_mock_client()
+    sub = RealTimeBarsSub(reqId=83, contract=_stock(1), bars=RealTimeBarList())
+
+    with reg.sending(sub):
+        pass
+
+    assert reg.get_sub(83) is sub
+    assert sub.closed is False
+
+
+def test_sending_without_a_subscription_registers_nothing():
+    reg, _ = _registry_with_mock_client()
+
+    with reg.sending(None):
+        pass
+    with pytest.raises(TypeError), reg.sending(None):
+        raise TypeError("rejected")
+
+    assert len(reg) == 0
+
+
+def test_a_subscription_the_registry_refuses_is_never_sent():
+    """A duplicate is refused before the block runs, and the live
+    subscription it duplicates is left alone."""
+    reg, _ = _registry_with_mock_client()
+    contract = _stock(1)
+    live = MktDataSub(reqId=84, contract=contract, ticker=_ticker(contract))
+    reg.add(live)
+    sent: list[int] = []
+
+    duplicate = MktDataSub(reqId=85, contract=contract, ticker=live.ticker)
+    with pytest.raises(KeyError), reg.sending(duplicate):
+        sent.append(duplicate.reqId)
+
+    assert sent == []
+    assert reg.get_sub(84) is live
+    assert live.closed is False
+
+
 # ---- bag / spread contracts (conId == 0) -----------------------------------
 
 
@@ -359,3 +496,19 @@ def test_wrapper_reset_replaces_subscription_registry():
     ib.wrapper.reset()
     assert ib.wrapper.subscriptions is not first
     assert len(ib.wrapper.subscriptions) == 0
+
+
+def test_the_registry_repr_does_not_print_its_wrapper():
+    assert "Wrapper(" not in repr(ibi.IB().wrapper.subscriptions)
+
+
+def test_a_moved_subscription_keeps_its_bars_in_step():
+    ib = ibi.IB()
+    bars = ibi.BarDataList()
+    bars.reqId = 1
+    sub = HistoricalBarsSub(reqId=1, contract=ibi.Stock("X", "SMART", "USD"), bars=bars)
+    ib.wrapper.subscriptions.add(sub)
+    ib.wrapper.subscriptions.move(sub, 2)
+    assert (sub.reqId, bars.reqId) == (2, 2)
+    assert ib.wrapper.subscriptions.get_sub(2) is sub
+    assert ib.wrapper.subscriptions.get_sub(1) is None

@@ -1,10 +1,13 @@
 """Access to account statement webservice."""
 
+from __future__ import annotations
+
 import logging
 import os
 import time
 import xml.etree.ElementTree as et
 from contextlib import suppress
+from pathlib import Path
 from typing import Final
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -25,6 +28,30 @@ https://www.interactivebrokers.com/campus/ibkr-api-page/flex-web-service/#flex-g
 
 class FlexError(Exception):
     pass
+
+
+_WEB_SCHEMES: Final = frozenset({"http", "https"})
+
+
+def _webUrl(url: str | None, source: str) -> str:
+    """Return ``url`` if it is an http(s) URL with a host; otherwise raise
+    FlexError. Keeps ``urlopen`` from reading other schemes such as
+    ``file://`` from a configured or server-supplied URL."""
+    try:
+        parsed = urlparse(url or "")
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.scheme not in _WEB_SCHEMES or not parsed.netloc:
+        raise FlexError(f"{source} is not an http(s) URL: {url!r}")
+    return url or ""
+
+
+def _requiredText(root: et.Element, tag: str) -> str:
+    """Text of the response's ``tag`` element, or FlexError if missing."""
+    elem = root.find(tag)
+    if elem is None or not elem.text:
+        raise FlexError(f"Flex response has no {tag}")
+    return elem.text
 
 
 class FlexReport:
@@ -54,9 +81,9 @@ class FlexReport:
 
     def topics(self):
         """Get the set of topics that can be extracted from this report."""
-        return set(node.tag for node in self.root.iter() if node.attrib)
+        return {node.tag for node in self.root.iter() if node.attrib}
 
-    def extract(self, topic: str, parseNumbers=True) -> list:
+    def extract(self, topic: str, parseNumbers: bool = True) -> list[DynamicObject]:
         """
         Extract items of given topic and return as list of objects.
 
@@ -75,25 +102,15 @@ class FlexReport:
         return results
 
     def df(self, topic: str, parseNumbers=True):
-        """Same as extract but return the result as a pandas DataFrame."""
+        """Same as extract but return the result as a polars DataFrame
+        (requires polars: ``pip install "ib_async[polars]"``)."""
         return util.df(self.extract(topic, parseNumbers))
 
     def get_url(self):
         """Generate flexreport URL."""
-
-        def is_valid_url(url: str) -> bool:
-            try:
-                result = urlparse(url)
-                # Must have scheme (http/https) and netloc (domain)
-                return all([result.scheme, result.netloc])
-            except Exception:
-                return False
-
-        _url = os.getenv("IB_FLEXREPORT_URL", FLEXREPORT_URL)
-        if is_valid_url(_url):
-            return _url
-        raise FlexError(
-            "Invalid URL, please check that env variable IB_FLEXREPORT_URL is set correctly."
+        return _webUrl(
+            os.getenv("IB_FLEXREPORT_URL", FLEXREPORT_URL),
+            "IB_FLEXREPORT_URL",
         )
 
     def download(self, token, queryId):
@@ -108,12 +125,8 @@ class FlexReport:
         root = et.fromstring(data)
         elem = root.find("Status")
         if elem is not None and elem.text == "Success":
-            elem = root.find("ReferenceCode")
-            assert elem is not None
-            code = elem.text
-            elem = root.find("Url")
-            assert elem is not None
-            baseUrl = elem.text
+            code = _requiredText(root, "ReferenceCode")
+            baseUrl = _webUrl(_requiredText(root, "Url"), "Flex response Url")
             _logger.info("Statement is being prepared...")
         else:
             elem = root.find("ErrorCode")
@@ -139,15 +152,17 @@ class FlexReport:
         _logger.info("Statement retrieved.")
 
     def load(self, path):
-        """Load report from XML file."""
-        with open(path, "rb") as f:
-            self.data = f.read()
+        """Load report from XML file. Raises FlexError if the file is not
+        valid XML."""
+        self.data = Path(path).read_bytes()
+        try:
             self.root = et.fromstring(self.data)
+        except et.ParseError as e:
+            raise FlexError(f"{path} is not a Flex report: {e}") from e
 
     def save(self, path):
         """Save report to XML file."""
-        with open(path, "wb") as f:
-            f.write(self.data)
+        Path(path).write_bytes(self.data)
 
 
 if __name__ == "__main__":

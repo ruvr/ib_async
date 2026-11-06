@@ -60,13 +60,13 @@ from ib_async._pb_msgids import (
     REQ_TICK_BY_TICK_DATA,
 )
 from ib_async._requests import ReqIdKey
+from ib_async._subscriptions import MktDataSub
 from tests._helpers import _captureSend, _decodeProtoFrame, _ibAtVersion
 
 
 def _seedTicker(ib, reqId: int, contract: ibi.Contract | None = None):
     """Register a real market-data subscription via SubscriptionRegistry
     so the wrapper has a Ticker to update when proto messages arrive."""
-    from ib_async._subscriptions import MktDataSub
 
     contract = contract or ibi.Stock("AAPL", "SMART", "USD")
     contract.conId = getattr(contract, "conId", None) or 7
@@ -146,7 +146,7 @@ def test_reroute_mkt_data_req_proto_does_not_raise():
 
 def test_head_timestamp_proto_settles_reqId():
     ib = _ibAtVersion(207)
-    req, _ = ib.wrapper.requests.open(ReqIdKey(7), container=[])
+    req = ib.wrapper.requests.open(ReqIdKey(7), container=[])
     assert not req.future.done()
     proto = HeadTimestamp_pb2.HeadTimestamp(reqId=7, headTimestamp="20100101 09:30:00")
     ib.client.decoder.processProtoBuf(88, proto.SerializeToString())
@@ -155,7 +155,7 @@ def test_head_timestamp_proto_settles_reqId():
 
 def test_histogram_data_proto_settles_reqId_with_items():
     ib = _ibAtVersion(207)
-    req, _ = ib.wrapper.requests.open(ReqIdKey(7), container=[])
+    req = ib.wrapper.requests.open(ReqIdKey(7), container=[])
     proto = HistogramData_pb2.HistogramData(reqId=7)
     e = proto.histogramDataEntries.add()
     e.price, e.size = 150.0, "100"
@@ -168,7 +168,7 @@ def test_histogram_data_proto_settles_reqId_with_items():
 
 def test_historical_data_end_proto_settles_singleton():
     ib = _ibAtVersion(207)
-    req, _ = ib.wrapper.requests.open(ReqIdKey(7), container=[])
+    req = ib.wrapper.requests.open(ReqIdKey(7), container=[])
     proto = HistoricalDataEnd_pb2.HistoricalDataEnd(
         reqId=7, startDateStr="20260101", endDateStr="20260509"
     )
@@ -206,7 +206,7 @@ def test_tick_by_tick_oneof_dispatch_routes_to_all_last():
 
 def test_historical_schedule_proto_settles_reqId():
     ib = _ibAtVersion(207)
-    req, _ = ib.wrapper.requests.open(ReqIdKey(7), container=[])
+    req = ib.wrapper.requests.open(ReqIdKey(7), container=[])
     proto = HistoricalSchedule_pb2.HistoricalSchedule(
         reqId=7,
         startDateTime="20260509 09:30:00",

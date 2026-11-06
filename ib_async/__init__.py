@@ -1,11 +1,10 @@
 """Python sync/async framework for Interactive Brokers API"""
 
-import dataclasses
-import sys
+from __future__ import annotations
 
 from eventkit import Event
 
-from . import util
+from . import datarequests, ordertypes, util
 from .client import Client
 from .contract import (
     CFD,
@@ -32,6 +31,9 @@ from .contract import (
     TradingSession,
     Warrant,
 )
+from .datarequests import checkDuration
+from .datarequests.generated import *  # noqa: F403  (data request value types)
+from .depth import DepthBook, DepthOperation
 from .flexreport import FlexError, FlexReport
 from .ib import IB, StartupFetch, StartupFetchALL, StartupFetchNONE
 from .ibcontroller import IBC, Watchdog
@@ -49,7 +51,6 @@ from .objects import (
     ExecutionFilter,
     FamilyCode,
     Fill,
-    FundamentalRatios,
     HistogramData,
     HistoricalNews,
     HistoricalSchedule,
@@ -65,6 +66,7 @@ from .objects import (
     NewsTick,
     OptionChain,
     OptionComputation,
+    OptionStrikes,
     PnL,
     PnLSingle,
     PortfolioItem,
@@ -83,15 +85,14 @@ from .objects import (
     TickByTickBidAsk,
     TickByTickMidPoint,
     TickData,
+    TimedOutRequest,
     TradeLogEntry,
     WshEventData,
 )
 from .order import (
     BracketOrder,
     ExecutionCondition,
-    LimitOrder,
     MarginCondition,
-    MarketOrder,
     Order,
     OrderAllocation,
     OrderCancel,
@@ -102,19 +103,37 @@ from .order import (
     OrderStatus,
     PercentChangeCondition,
     PriceCondition,
-    StopLimitOrder,
-    StopOrder,
     TimeCondition,
     Trade,
     VolumeCondition,
+)
+from .ordertypes import OrderTypeError
+from .ordertypes.attached import *  # noqa: F403  (adjustable stops, FX hedge)
+from .ordertypes.generated import *  # noqa: F403  (order types, algos, routing)
+from .runtime import (
+    CodeCount,
+    ConnectionState,
+    Counters,
+    RequestState,
+    RuntimeState,
+    SubscriptionState,
+    TransportState,
 )
 from .ticker import HaltedStatus, Ticker
 from .version import __version__, __version_info__
 from .wrapper import RequestError, Wrapper
 
 __all__ = [
+    # The constructors; the catalog and its tools stay in ib_async.ordertypes.
+    *ordertypes.generated.__all__,
+    *datarequests.generated.__all__,
+    "checkDuration",
+    *ordertypes.attached.__all__,
+    "OrderTypeError",
     "Event",
     "util",
+    "ordertypes",
+    "datarequests",
     "Client",
     "Bag",
     "Bond",
@@ -159,7 +178,6 @@ __all__ = [
     "ExecutionFilter",
     "FamilyCode",
     "Fill",
-    "FundamentalRatios",
     "HistogramData",
     "HistoricalNews",
     "HistoricalTick",
@@ -174,6 +192,7 @@ __all__ = [
     "NewsTick",
     "OptionChain",
     "OptionComputation",
+    "OptionStrikes",
     "PnL",
     "PnLSingle",
     "PortfolioItem",
@@ -193,12 +212,11 @@ __all__ = [
     "TickByTickBidAsk",
     "TickByTickMidPoint",
     "TickData",
+    "TimedOutRequest",
     "TradeLogEntry",
     "BracketOrder",
     "ExecutionCondition",
-    "LimitOrder",
     "MarginCondition",
-    "MarketOrder",
     "Order",
     "OrderAllocation",
     "OrderCancel",
@@ -208,11 +226,11 @@ __all__ = [
     "OrderStatus",
     "PercentChangeCondition",
     "PriceCondition",
-    "StopLimitOrder",
-    "StopOrder",
     "TimeCondition",
     "Trade",
     "VolumeCondition",
+    "DepthBook",
+    "DepthOperation",
     "Ticker",
     "HaltedStatus",
     "__version__",
@@ -222,16 +240,11 @@ __all__ = [
     "StartupFetch",
     "StartupFetchALL",
     "StartupFetchNONE",
+    "CodeCount",
+    "ConnectionState",
+    "Counters",
+    "RequestState",
+    "RuntimeState",
+    "SubscriptionState",
+    "TransportState",
 ]
-
-
-# compatibility with old Object
-for obj in locals().copy().values():
-    if dataclasses.is_dataclass(obj):
-        obj.dict = util.dataclassAsDict  # type: ignore[union-attr]
-        obj.tuple = util.dataclassAsTuple  # type: ignore[union-attr]
-        obj.update = util.dataclassUpdate  # type: ignore[union-attr]
-        obj.nonDefaults = util.dataclassNonDefaults  # type: ignore[union-attr]
-
-del sys
-del dataclasses

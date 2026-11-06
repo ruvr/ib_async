@@ -10,6 +10,9 @@ Properties verified:
     (replacing the previous hard ``assert`` that crashed retries).
 """
 
+from __future__ import annotations
+
+import asyncio
 from unittest.mock import MagicMock
 
 import ib_async as ibi
@@ -63,7 +66,6 @@ def test_keepUpToDate_historical_data_registers_sub():
     """The keepUpToDate=True path adds a HistoricalBarsSub. We exercise
     just the registration step here (the full reqHistoricalDataAsync is
     integration-shaped); the cancel side is covered by the next test."""
-    import asyncio
 
     ib = _wired_ib()
     contract = _stock(2)
@@ -80,8 +82,9 @@ def test_keepUpToDate_historical_data_registers_sub():
         keepUpToDate=True,
         timeout=0,
     )
-    task = asyncio.get_event_loop().create_task(coro)
-    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0))
+    loop = ibi.util.getLoop()
+    task = loop.create_task(coro)
+    loop.run_until_complete(asyncio.sleep(0))
 
     # Find the registered subscription via reqId. getReqId.side_effect
     # produced 300 first.

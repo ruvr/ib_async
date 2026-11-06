@@ -18,7 +18,10 @@ Happy-path round-trip tests follow at the end.
 
 from __future__ import annotations
 
+import dataclasses
 from decimal import Decimal
+
+import pytest
 
 from ib_async._pb import (
     ComboLeg_pb2,
@@ -102,16 +105,15 @@ def test_combo_leg_proto_reads_from_source_not_target():
     # ``designatedLocation`` is a string; empty string suppresses the
     # write so a default ComboLeg leaves the field unset on the wire.
     assert not proto.HasField("designatedLocation")
-    # ``openClose`` is an int gated by ``isValidIntValue`` (IBKR's
-    # reference) — ``0`` flows through as a real wire value.
+    # ``openClose`` is an int written unless it is the UNSET sentinel
+    # — ``0`` flows through as a real wire value.
     assert proto.HasField("openClose")
     assert proto.openClose == 0
 
 
 def test_combo_leg_proto_emits_default_exempt_code_value():
-    # ``exemptCode`` default is ``-1`` — IBKR's reference treats this
-    # as a real wire value ("not exempt") and emits it via the
-    # ``isValidIntValue`` gate (only ``UNSET_INTEGER`` suppresses).
+    # ``exemptCode`` default is ``-1`` — a real wire value ("not
+    # exempt") that is emitted (only ``UNSET_INTEGER`` suppresses).
     # Skipping the write would let the server's proto3-default fill
     # the field with the sentinel.
     leg = ComboLeg()
@@ -239,6 +241,7 @@ def test_create_contract_details_handles_completely_empty_proto():
     assert isinstance(details, ContractDetails)
     assert details.contract is contract
     assert details.marketName == ""
+    assert details.settlementMethod == ""
     # Decimal-typed numeric fields default to ``None`` for "unset" so
     # ``if price:`` correctly evaluates falsy in user code.
     assert details.minTick is None
@@ -375,6 +378,7 @@ def test_create_contract_details_populates_fund_family_fields():
     proto.eventContract1 = "EC1"
     proto.eventContractDescription1 = "First desc"
     proto.eventContractDescription2 = "Second desc"
+    proto.settlementMethod = "Cash"
     proto.minAlgoSize = "5"
     proto.lastPricePrecision = "0.01"
     proto.lastSizePrecision = "0.001"
@@ -399,6 +403,7 @@ def test_create_contract_details_populates_fund_family_fields():
     assert details.eventContract1 == "EC1"
     assert details.eventContractDescription1 == "First desc"
     assert details.eventContractDescription2 == "Second desc"
+    assert details.settlementMethod == "Cash"
     assert details.minAlgoSize == Decimal(5)
     assert details.lastPricePrecision == Decimal("0.01")
     assert details.lastSizePrecision == Decimal("0.001")
@@ -434,6 +439,7 @@ def test_create_contract_details_from_contract_data_handles_missing_inner():
     assert details.contract is not None
     assert details.contract.symbol == "AAPL"
     assert details.marketName == ""
+    assert details.settlementMethod == ""
 
 
 # ---------------------------------------------------------------------------
@@ -465,13 +471,12 @@ def test_create_contract_description_handles_missing_inner_contract():
 # Send-side "no strike" / "no last trade date" suppression
 #
 # Regression: an option-chain sweep asks the server for EVERY strike of a
-# contract month by sending a contract with no strike set. IBKR's reference
-# gates ``strike`` on ``isValidFloatValue`` because THEIR ``Contract.strike``
-# defaults to ``UNSET_DOUBLE``; ours defaults to ``0.0``, so the bare
-# sentinel check put ``strike: 0`` on the wire for every strikeless contract
-# and the server answered ``Error 200: No security definition has been found
-# for the request``. ``lastTradeDate`` is receive-only in IBKR's reference and
-# was never sent by the binary path.
+# contract month by sending a contract with no strike set. Our
+# ``Contract.strike`` defaults to ``0.0``, so a bare ``!= UNSET_DOUBLE``
+# check put ``strike: 0`` on the wire for every strikeless contract and the
+# server answered ``Error 200: No security definition has been found for
+# the request``. ``lastTradeDate`` is receive-only and was never sent by
+# the binary path.
 # ---------------------------------------------------------------------------
 
 
@@ -508,8 +513,9 @@ def test_create_contract_proto_emits_real_strike():
 
 
 def test_create_contract_proto_still_emits_zero_conid():
-    # conId stays at IBKR's reference gate: their default IS 0, and the
-    # server reads an absent slot as UNSET_INTEGER and rejects the request.
+    # conId is written unless it is the UNSET sentinel, so 0 is emitted:
+    # the server reads an absent slot as UNSET_INTEGER and rejects the
+    # request.
     contract = Contract(secType="FOP", symbol="ES", conId=0)
     proto = createContractProto(contract)
     assert proto.HasField("conId")
@@ -545,3 +551,11 @@ def test_contract_data_request_proto_for_chain_sweep_has_no_strike():
     assert request.reqId == 42
     assert not request.contract.HasField("strike")
     assert request.contract.secType == "FOP"
+
+
+def test_ineligibility_reason_is_an_immutable_hashable_record():
+    reason = IneligibilityReason(id_="R1", description="Restricted")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        reason.description = "changed"  # type: ignore[misc]
+    assert not hasattr(reason, "__dict__")
+    assert {reason, IneligibilityReason(id_="R1", description="Restricted")} == {reason}

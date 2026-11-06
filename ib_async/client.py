@@ -1,5 +1,7 @@
 """Socket client for communicating with Interactive Brokers."""
 
+from __future__ import annotations
+
 import asyncio
 import io
 import logging
@@ -7,18 +9,21 @@ import math
 import struct
 import time
 from collections import deque
-from collections.abc import Callable
-from typing import Any, Final
+from collections.abc import Callable, Sequence
+from decimal import Decimal
 
 from eventkit import Event
+from google.protobuf.message import Message
 
 from . import _pb_msgids as _M
+from . import _proto as _converters
 from ._pb_msgids import (
     MIN_SERVER_VER_PROTOBUF,
     PROTOBUF_MSG_ID,
     PROTOBUF_MSG_IDS,
 )
 from ._server_versions import (
+    MAX_CLIENT_VER,
     MIN_SERVER_VER_ADVANCED_ORDER_REJECT,
     MIN_SERVER_VER_AUTO_CANCEL_PARENT,
     MIN_SERVER_VER_CME_TAGGING_FIELDS,
@@ -38,98 +43,83 @@ from ._server_versions import (
     MIN_SERVER_VER_UNDO_RFQ_FIELDS,
 )
 from .connection import Connection
-from .contract import Contract
+from .contract import Contract, TagValue
 from .decoder import Decoder
 from .objects import ConnectionStats, WshEventData
+from .order import OrderCancel
+from .runtime import ConnectionPhase, ConnectionState, Tally, TransportState
 from .util import UNSET_DOUBLE, UNSET_INTEGER, dataclassAsTuple, getLoop, run
 
+# A value written as one field of a binary request message.
+WireField = Contract | float | int | str | bool | Decimal | Sequence[TagValue] | None
 
-def _make_format_handlers(makeEmpty: bool) -> dict[Any, Callable[[Any], str]]:
-    """Build the IBKR-protocol field-format handler table.
 
-    The two module-level dict instances below
-    (``_FORMAT_HANDLERS_EMPTY`` / ``_FORMAT_HANDLERS_KEEP``) are
-    constructed once at import time; ``Client.send`` selects between
-    them by the ``makeEmpty`` flag instead of rebuilding the dict
-    (and its closures) on every outbound message.
+def _formatContract(c: Contract) -> str:
+    """Format a contract as its fields in IBKR's order, separated by NUL."""
+    return "\0".join(
+        str(f)
+        for f in (
+            c.conId,
+            c.symbol,
+            c.secType,
+            c.lastTradeDateOrContractMonth,
+            c.strike,
+            c.right,
+            c.multiplier,
+            c.exchange,
+            c.primaryExchange,
+            c.currency,
+            c.localSymbol,
+            c.tradingClass,
+        )
+    )
+
+
+def _formatField(field: WireField, makeEmpty: bool) -> str:
+    """Return the wire text for one field of a binary message.
+
+    With ``makeEmpty``, the IBKR unset values ``UNSET_INTEGER`` and
+    ``UNSET_DOUBLE`` are written as the empty string. The server expects
+    the empty string for an unset field. Without ``makeEmpty``, they are
+    written unchanged. Positive infinity is written as ``Infinity``,
+    which is the only spelling the server accepts. One example is
+    ``competeAgainstBestOffset`` set to
+    ``COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID``. The checks use the exact
+    type. A ``bool`` is written as ``1`` or ``0``, not as an ``int``. A
+    ``Decimal`` is written with ``str``.
     """
-    # fmt: off
-    return {
-        # Contracts are formatted in IBKR null delimiter format
-        Contract: lambda c: "\0".join([
-            str(f)
-            for f in (
-                c.conId,
-                c.symbol,
-                c.secType,
-                c.lastTradeDateOrContractMonth,
-                c.strike,
-                c.right,
-                c.multiplier,
-                c.exchange,
-                c.primaryExchange,
-                c.currency,
-                c.localSymbol,
-                c.tradingClass,
-            )
-        ]),
-
-        # Float conversion has 3 stages:
-        #  - Convert 'IBKR unset' double to empty (if requested)
-        #  - Convert positive infinity to the IBKR ``INFINITY_STR``
-        #    constant. IBKR's reference (``ibapi/const.py``) defines this
-        #    as the literal ``"Infinity"`` (not ``"Infinite"``); the
-        #    server parses ``"Infinity"`` for fields like
-        #    ``competeAgainstBestOffset = COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID``
-        #    and rejects any other spelling. Sending ``"Infinite"``
-        #    silently corrupts those mid-peg orders.
-        #  - else, convert float to string normally
-        float: lambda f: ""
-        if (makeEmpty and f == UNSET_DOUBLE)
-        else ("Infinity" if (f == math.inf) else str(f)),
-
-        # Int conversion has 2 stages:
-        #  - Convert 'IBKR unset' to empty (if requested)
-        #  - else, convert int to string normally
-        int: lambda f: "" if makeEmpty and f == UNSET_INTEGER else str(f),
-
-        # None is always just an empty string.
-        # (due to a quirk of Python, 'type(None)' is how you properly generate the NoneType value)
-        type(None): lambda _: "",
-
-        # Strings are always strings
-        str: lambda s: s,
-
-        # Bools become strings "1" or "0"
-        bool: lambda b: "1" if b else "0",
-
-        # Lists of tags become semicolon-appended KV pairs
-        list: lambda lst: "".join([f"{v.tag}={v.value};" for v in lst]),
-    }
-    # fmt: on
+    if isinstance(field, Contract):  # any Contract subclass
+        return _formatContract(field)
+    if type(field) is str:
+        return field
+    if type(field) is bool:
+        return "1" if field else "0"
+    if type(field) is int:
+        return "" if makeEmpty and field == UNSET_INTEGER else str(field)
+    if type(field) is float:
+        if makeEmpty and field == UNSET_DOUBLE:
+            return ""
+        return "Infinity" if field == math.inf else str(field)
+    if field is None:
+        return ""
+    if type(field) is list or type(field) is tuple:
+        return "".join(f"{v.tag}={v.value};" for v in field)
+    return str(field)
 
 
-_FORMAT_HANDLERS_EMPTY: Final[dict[Any, Callable[[Any], str]]] = _make_format_handlers(
-    makeEmpty=True
-)
-_FORMAT_HANDLERS_KEEP: Final[dict[Any, Callable[[Any], str]]] = _make_format_handlers(
-    makeEmpty=False
-)
+# The name of each connection state, indexed by Client.DISCONNECTED,
+# Client.CONNECTING and Client.CONNECTED (0, 1, 2).
+_PHASES: tuple[ConnectionPhase, ...] = ("disconnected", "connecting", "connected")
 
 
 class Client:
     """
-    Replacement for ``ibapi.client.EClient`` that uses asyncio.
+    The TWS API client, built on asyncio.
 
-    The client is fully asynchronous and has its own
-    event-driven networking code that replaces the
-    networking code of the standard EClient.
-    It also replaces the infinite loop of ``EClient.run()``
-    with the asyncio event loop. It can be used as a drop-in
-    replacement for the standard EClient as provided by IBAPI.
+    The client is fully asynchronous, has its own event-driven
+    networking code, and runs on the asyncio event loop.
 
-    Compared to the standard EClient this client has the following
-    additional features:
+    This client has the following features:
 
     * ``client.connect()`` will block until the client is ready to
       serve requests; It is not necessary to wait for ``nextValidId``
@@ -190,16 +180,18 @@ class Client:
     # paired with patches to every send-side / receive-side gated field
     # at gates between the old cap and the new — see
     # ``ib_async/_server_versions.py`` for the symbolic gate constants.
-    # As of v3.0 the binary path handles all gates 158-225 and the
+    # As of v3.0 the binary path handles all gates 158-226 and the
     # protobuf path takes over per-message-family at 201-213.
     MinClientVersion = 157
-    MaxClientVersion = 225
+    MaxClientVersion = MAX_CLIENT_VER
 
     DISCONNECTED, CONNECTING, CONNECTED = range(3)
 
-    def __init__(self, wrapper):
+    def __init__(self, wrapper, tally: Tally | None = None):
         self.wrapper = wrapper
-        self.decoder = Decoder(wrapper, 0)
+        # The session's counters (ib_async.runtime); IB passes its wrapper's.
+        self.tally = Tally() if tally is None else tally
+        self.decoder = Decoder(wrapper, 0, self.tally)
         self.apiStart = Event("apiStart")
         self.apiEnd = Event("apiEnd")
         self.apiError = Event("apiError")
@@ -221,19 +213,29 @@ class Client:
         self.clientId = -1
         self.optCapab = ""
         self.connectOptions = b""
+        # Set while connectAsync waits for the API to start. A disconnect
+        # before the start fails it, so connectAsync raises at once.
+        self._apiStarting: asyncio.Future[None] | None = None
         self.reset()
 
     def reset(self):
         self.connState = Client.DISCONNECTED
         self._apiReady = False
+        # The server's error from before the API started, such as 326
+        # for a client id already in use. TWS closes the socket after it.
+        self._refusal = ""
         self._serverVersion = 0
         self._data = b""
         self._hasReqId = False
         self._reqIdSeq = 0
         self._accounts = []
         self._startTime = time.time()
-        self._numBytesRecv = 0
-        self._numMsgRecv = 0
+        # Traffic is counted once, in the session's tally. The current
+        # connection's is what the tally counts after these.
+        self._framesSentBefore = self.tally.framesSent
+        self._bytesSentBefore = self.tally.bytesSent
+        self._framesReceivedBefore = self.tally.framesReceived
+        self._bytesReceivedBefore = self.tally.bytesReceived
         self._isThrottling = False
         self._msgQ: deque[bytes] = deque()
         self._timeQ: deque[float] = deque()
@@ -244,10 +246,9 @@ class Client:
     def useProtoBuf(self, canonicalMsgId: int) -> bool:
         """True when ``canonicalMsgId`` should be sent as protobuf.
 
-        Consults the ``PROTOBUF_MSG_IDS`` per-message gate table mirrored
-        from IBKR's reference. Messages not in the table (and connections
-        below the per-family minimum server version) stay on the legacy
-        binary path.
+        Consults the ``PROTOBUF_MSG_IDS`` per-message gate table. Messages
+        not in the table (and connections below the per-family minimum
+        server version) stay on the legacy binary path.
         """
         gate = PROTOBUF_MSG_IDS.get(canonicalMsgId)
         if gate is None:
@@ -257,17 +258,27 @@ class Client:
     def sendProto(self, canonicalMsgId: int, serialized: bytes) -> None:
         """Send a protobuf-framed message.
 
-        Wire framing matches IBKR ``ibapi/comm.py:make_msg_proto``:
-        4-byte big-endian length prefix, then 4-byte big-endian wire
-        ``msgId = canonical + PROTOBUF_MSG_ID``, then the serialized
-        protobuf body. Receivers detect the +200 sentinel and route to
+        Wire framing: 4-byte big-endian length prefix, then 4-byte
+        big-endian wire ``msgId = canonical + PROTOBUF_MSG_ID``, then the
+        serialized protobuf body. Receivers detect the +200 sentinel and route to
         the protobuf decoder; everything else stays binary.
+
+        Handed to ``sendMsg`` like every binary frame, so protobuf
+        messages share the ONE outbound queue. Writing to ``conn``
+        directly (as this did) put proto frames outside the
+        ``MaxRequests`` / ``RequestsInterval`` pacing budget AND let
+        them overtake binary frames already waiting in the queue — on a
+        207+ gateway that is most of the session's traffic, including
+        every order. Request order and the IBKR pacing contract are not
+        optional for order messages.
         """
         wireMsgId = canonicalMsgId + PROTOBUF_MSG_ID
         body = struct.pack(">I", wireMsgId) + serialized
-        self.conn.sendMsg(self._prefix(body))
+        self.sendMsg(body)
 
-    def _tryProto(self, canonicalMsgId: int, build_proto: Callable[[], Any]) -> bool:
+    def _tryProto(
+        self, canonicalMsgId: int, build_proto: Callable[[], Message]
+    ) -> bool:
         """Emit the protobuf-encoded frame for ``canonicalMsgId`` when the
         negotiated server supports it. Returns True when the proto path
         handled the send so callers can early-return; False when the caller
@@ -301,9 +312,9 @@ class Client:
         return ConnectionStats(
             self._startTime,
             time.time() - self._startTime,
-            self._numBytesRecv,
+            self.tally.bytesReceived - self._bytesReceivedBefore,
             self.conn.numBytesSent,
-            self._numMsgRecv,
+            self.tally.framesReceived - self._framesReceivedBefore,
             self.conn.numMsgSent,
         )
 
@@ -339,9 +350,8 @@ class Client:
     def setOptionalCapabilities(self, optCapab: str) -> None:
         """Set the optional capabilities string sent with ``startApi``.
 
-        Mirrors IBKR ``EClient.setOptionalCapabilities``. The value is
-        included in the START_API frame (binary path field 4 / proto
-        ``optionalCapabilities``) and gated server-side by
+        The value is included in the START_API frame (binary path field
+        4 / proto ``optionalCapabilities``) and gated server-side by
         ``MIN_SERVER_VER_OPTIONAL_CAPABILITIES`` (=72). Our
         ``MinClientVersion`` is 157 so the gate is always satisfied.
         Must be called before ``connectAsync`` to take effect — the
@@ -370,10 +380,12 @@ class Client:
             self._logger.info(
                 f"Connecting to {host}:{port} with clientId {clientId}..."
             )
+            self.tally.connectAttempts += 1
             self.host = host
             self.port = int(port)
             self.clientId = int(clientId)
             self.connState = Client.CONNECTING
+            self._apiStarting = getLoop().create_future()
             timeout = timeout or None
             await asyncio.wait_for(self.conn.connectAsync(host, port), timeout)
             self._logger.info("Connected")
@@ -386,9 +398,11 @@ class Client:
                 )
             )
             self.conn.sendMsg(msg)
-            await asyncio.wait_for(self.apiStart, timeout)
+            self._counted(msg)
+            await asyncio.wait_for(self._apiStarting, timeout)
             self._logger.info("API connection ready")
         except BaseException as e:
+            self.tally.connectFailures += 1
             self.disconnect()
             msg = f"API connection failed: {e!r}"
             self._logger.error(msg)
@@ -396,6 +410,14 @@ class Client:
             if isinstance(e, ConnectionRefusedError):
                 self._logger.error("Make sure API port on TWS/IBG is open")
             raise
+        finally:
+            # The future lives only for this call. A refused or timed-out
+            # socket connect raises before the await, and disconnect() then
+            # fails the future with nobody waiting on it, so read its
+            # failure here; otherwise the loop reports it as never retrieved.
+            starting, self._apiStarting = self._apiStarting, None
+            if starting is not None and starting.done() and not starting.cancelled():
+                starting.exception()
 
     def disconnect(self):
         """Disconnect from IB connection."""
@@ -412,6 +434,7 @@ class Client:
         # becomes a no-op (just logs "Disconnected.").
         wasReady = self.isReady()
         self.connState = Client.DISCONNECTED
+        self._failApiStart("Disconnected before the API started")
         self.conn.disconnect()
         if wasReady:
             self.wrapper.connectionClosed()
@@ -419,7 +442,7 @@ class Client:
         if wasReady:
             self.apiEnd.emit()
 
-    def send(self, *fields, makeEmpty=True):
+    def send(self, *fields: WireField, makeEmpty: bool = True) -> None:
         """Serialize and send the given fields using the IB socket protocol.
 
         if 'makeEmpty' is True (default), then the IBKR values representing "no value"
@@ -427,31 +450,20 @@ class Client:
         if not self.isConnected():
             raise ConnectionError("Not connected")
 
-        # The two handler dicts are built once at module import — see
-        # ``_make_format_handlers`` above for the full table including
-        # the per-type lambdas and their inline rationales.
-        FORMAT_HANDLERS = _FORMAT_HANDLERS_EMPTY if makeEmpty else _FORMAT_HANDLERS_KEEP
-
         # First field is always the canonical msgId; remaining fields are
         # the body. Pre-201 servers receive both as NUL-terminated text;
         # 201+ servers receive a 4-byte big-endian raw msgId followed by
-        # the NUL-terminated body, mirroring IBKR ``comm.make_msg``'s
-        # ``useRawIntMsgId`` branch (`make_msg(msgId, useRawIntMsgId=True,
-        # text)`). Sending the legacy text msgId to a 201+ server makes
+        # the NUL-terminated body. Sending the legacy text msgId to a 201+ server makes
         # the server fail to decode the frame and silently drop the
         # connection — every binary-path message (startApi, anything
         # that's not in PROTOBUF_MSG_IDS, anything below its proto gate)
         # is affected.
         msgId = fields[0]
+        if not isinstance(msgId, int):
+            raise TypeError(f"the first field is the message id, not {msgId!r}")
         body = io.StringIO()
         for field in fields[1:]:
-            # Fetch type converter for this field (falls back to 'str(field)' as a default for unmatched types)
-            # (extra `isinstance()` wrapper needed here because Contract subclasses are their own type, but we want
-            #  to only match against the Contract parent class for formatting operations)
-            convert = FORMAT_HANDLERS.get(
-                Contract if isinstance(field, Contract) else type(field), str
-            )
-            body.write(convert(field))
+            body.write(_formatField(field, makeEmpty))
             body.write("\0")
 
         text = body.getvalue().encode()
@@ -474,26 +486,61 @@ class Client:
 
         while msgs and (len(times) < self.MaxRequests or not self.MaxRequests):
             msg = msgs.popleft()
-            self.conn.sendMsg(self._prefix(msg))
+            framed = self._prefix(msg)
+            self.conn.sendMsg(framed)
+            self._counted(framed)
             times.append(t)
             if self._logger.isEnabledFor(logging.DEBUG):
                 self._logger.debug(">>> %r", msg)
 
         if msgs:
+            self.tally.mostQueued = max(self.tally.mostQueued, len(msgs))
             if not self._isThrottling:
                 self._isThrottling = True
+                self.tally.throttleStarts += 1
                 self.throttleStart.emit()
                 self._logger.debug("Started to throttle requests")
             loop.call_at(times[0] + self.RequestsInterval, self.sendMsg, None)
-        else:
-            if self._isThrottling:
-                self._isThrottling = False
-                self.throttleEnd.emit()
-                self._logger.debug("Stopped to throttle requests")
+        elif self._isThrottling:
+            self._isThrottling = False
+            self.throttleEnd.emit()
+            self._logger.debug("Stopped to throttle requests")
 
     def _prefix(self, msg):
         # prefix a message with its length
         return struct.pack(">I", len(msg)) + msg
+
+    def _counted(self, frame: bytes) -> None:
+        """Count a frame written to the socket."""
+        self.tally.framesSent += 1
+        self.tally.bytesSent += len(frame)
+
+    def connectionState(self) -> ConnectionState:
+        """The connection, as :class:`ib_async.runtime.ConnectionState`."""
+        return ConnectionState(
+            phase=_PHASES[self.connState],
+            apiReady=self._apiReady,
+            host=self.host,
+            port=self.port,
+            clientId=self.clientId,
+            serverVersion=self._serverVersion or None,
+            accounts=tuple(self.wrapper.accounts),
+        )
+
+    def transportState(self) -> TransportState:
+        """The current connection's traffic and pacing, as
+        :class:`ib_async.runtime.TransportState`."""
+        tally = self.tally
+        return TransportState(
+            framesSent=tally.framesSent - self._framesSentBefore,
+            bytesSent=tally.bytesSent - self._bytesSentBefore,
+            framesReceived=tally.framesReceived - self._framesReceivedBefore,
+            bytesReceived=tally.bytesReceived - self._bytesReceivedBefore,
+            throttling=self._isThrottling,
+            queuedFrames=len(self._msgQ),
+            maxRequests=self.MaxRequests,
+            requestsInterval=float(self.RequestsInterval),
+        )
 
     def _onSocketHasData(self, data):
         debug = self._logger.isEnabledFor(logging.DEBUG)
@@ -501,7 +548,8 @@ class Client:
             self._tcpDataArrived()
 
         self._data += data
-        self._numBytesRecv += len(data)
+        tally = self.tally
+        tally.bytesReceived += len(data)
 
         while True:
             if len(self._data) <= 4:
@@ -515,7 +563,7 @@ class Client:
 
             body = self._data[4:msgEnd]
             self._data = self._data[msgEnd:]
-            self._numMsgRecv += 1
+            tally.framesReceived += 1
 
             # Wire framing depends on server version and the +200 sentinel.
             # Pre-handshake and legacy (<201) servers use NUL-separated
@@ -547,8 +595,7 @@ class Client:
                         elif canonicalMsgId == 15:
                             self._accounts = list(self.wrapper.accounts)
                         if self._hasReqId and self._accounts:
-                            self._apiReady = True
-                            self.apiStart.emit()
+                            self._startedApi()
                     continue
                 fields = [
                     str(wireMsgId),
@@ -587,8 +634,7 @@ class Client:
                         _, _, accts = fields
                         self._accounts = [a for a in accts.split(",") if a]
                     if self._hasReqId and self._accounts:
-                        self._apiReady = True
-                        self.apiStart.emit()
+                        self._startedApi()
 
                 # decode and handle the message
                 self.decoder.interpret(fields)
@@ -596,18 +642,47 @@ class Client:
         if self._tcpDataProcessed:
             self._tcpDataProcessed()
 
+    def _startedApi(self) -> None:
+        self._apiReady = True
+        self.tally.connects += 1
+        if self._apiStarting is not None and not self._apiStarting.done():
+            self._apiStarting.set_result(None)
+        self.apiStart.emit()
+
+    def _failApiStart(self, reason: str) -> None:
+        if self._apiStarting is not None and not self._apiStarting.done():
+            self._apiStarting.set_exception(ConnectionError(reason))
+
+    def startupError(self, errorCode: int, errorString: str) -> None:
+        """Record a server error that arrived before the API started.
+
+        TWS sends an error such as 326 (client id already in use) and
+        then closes the socket. The close fails ``connectAsync`` with
+        this error as the reason. After the API starts this does nothing.
+        """
+        if not self._apiReady:
+            self._refusal = f"Error {errorCode}: {errorString}"
+
     def _onSocketDisconnected(self, msg):
         wasReady = self.isReady()
         if not self.isConnected():
             self._logger.info("Disconnected.")
         elif not msg:
-            msg = "Peer closed connection."
-            if not wasReady:
-                msg += f" clientId {self.clientId} already in use?"
+            if self._refusal:
+                msg = f"Peer closed connection after {self._refusal}"
+            else:
+                msg = "Peer closed connection."
+                if not wasReady:
+                    msg += f" clientId {self.clientId} already in use?"
 
         if msg:
             self._logger.error(msg)
             self.apiError.emit(msg)
+
+        if not wasReady:
+            self._failApiStart(
+                self._refusal or msg or "Peer closed connection during the handshake"
+            )
 
         # ``connectionClosed`` is the single teardown path: it fails
         # every in-flight request, closes every Subscription, sets done
@@ -635,9 +710,7 @@ class Client:
         mktDataOptions,
     ):
         def _proto():
-            from ._proto.market_data import createMarketDataRequestProto
-
-            return createMarketDataRequestProto(
+            return _converters.market_data.createMarketDataRequestProto(
                 reqId,
                 contract,
                 genericTickList,
@@ -667,9 +740,7 @@ class Client:
 
     def cancelMktData(self, reqId):
         def _proto():
-            from ._proto.market_data import createCancelMarketDataProto
-
-            return createCancelMarketDataProto(reqId)
+            return _converters.market_data.createCancelMarketDataProto(reqId)
 
         if self._tryProto(_M.CANCEL_MKT_DATA, _proto):
             return
@@ -700,9 +771,9 @@ class Client:
         # server uses protobuf for orders but binary for historical
         # data, etc.
         def _proto():
-            from ._proto.orders import createPlaceOrderRequestProto
-
-            return createPlaceOrderRequestProto(orderId, contract, order)
+            return _converters.orders.createPlaceOrderRequestProto(
+                orderId, contract, order
+            )
 
         if self._tryProto(_M.PLACE_ORDER, _proto):
             return
@@ -710,7 +781,7 @@ class Client:
         version = self.serverVersion()
 
         # The IBKR API protocol is just a series of in-order arguments denoted by position.
-        # The upstream API parses all fields based on the first value (the message type).
+        # The server parses all fields based on the first value (the message type).
         fields = [
             3,  # PLACE_ORDER message type
             orderId,
@@ -940,7 +1011,7 @@ class Client:
             elif order.orderType in {"PEG MID", "PEGMID"}:
                 fields += [order.midOffsetAtWhole, order.midOffsetAtHalf]
 
-        # Gates 178+ — mirror IBKR ``client.py:placeOrder`` lines 2746-2763.
+        # Gates 178+.
 
         if version >= MIN_SERVER_VER_CUSTOMER_ACCOUNT:
             fields += [order.customerAccount]
@@ -974,7 +1045,6 @@ class Client:
         # ``manualCancelOrderTime: str`` form is supported for backwards
         # compatibility — a bare string promotes to an OrderCancel
         # carrying just that field.
-        from .order import OrderCancel
 
         if orderCancel is None:
             orderCancel = OrderCancel()
@@ -982,9 +1052,7 @@ class Client:
             orderCancel = OrderCancel(manualOrderCancelTime=orderCancel)
 
         def _proto():
-            from ._proto.orders import createCancelOrderRequestProto
-
-            return createCancelOrderRequestProto(
+            return _converters.orders.createCancelOrderRequestProto(
                 orderId,
                 manualOrderCancelTime=orderCancel.manualOrderCancelTime,
                 extOperator=orderCancel.extOperator,
@@ -998,7 +1066,7 @@ class Client:
         # (192): IBKR drops the legacy ``VERSION=1`` prefix and appends
         # ``extOperator`` + ``manualOrderIndicator``. There's also an
         # interim RFQ_FIELDS triplet on servers in [187, 190).
-        fields: list[Any] = [4]
+        fields: list[WireField] = [4]
         if self.serverVersion() < MIN_SERVER_VER_CME_TAGGING_FIELDS:
             fields.append(1)  # legacy VERSION
         fields.append(orderId)
@@ -1016,9 +1084,7 @@ class Client:
 
     def reqOpenOrders(self):
         def _proto():
-            from ._proto.orders import createOpenOrdersRequestProto
-
-            return createOpenOrdersRequestProto()
+            return _converters.orders.createOpenOrdersRequestProto()
 
         if self._tryProto(_M.REQ_OPEN_ORDERS, _proto):
             return
@@ -1026,9 +1092,9 @@ class Client:
 
     def reqAccountUpdates(self, subscribe, acctCode):
         def _proto():
-            from ._proto.accounts import createAccountDataRequestProto
-
-            return createAccountDataRequestProto(subscribe, acctCode)
+            return _converters.accounts.createAccountDataRequestProto(
+                subscribe, acctCode
+            )
 
         if self._tryProto(_M.REQ_ACCT_DATA, _proto):
             return
@@ -1036,13 +1102,11 @@ class Client:
 
     def reqExecutions(self, reqId, execFilter):
         def _proto():
-            from ._proto.orders import createExecutionRequestProto
-
-            return createExecutionRequestProto(reqId, execFilter)
+            return _converters.orders.createExecutionRequestProto(reqId, execFilter)
 
         if self._tryProto(_M.REQ_EXECUTIONS, _proto):
             return
-        fields: list[Any] = [
+        fields: list[WireField] = [
             7,
             3,
             reqId,
@@ -1075,9 +1139,7 @@ class Client:
 
     def reqContractDetails(self, reqId, contract):
         def _proto():
-            from ._proto.contracts import createContractDataRequestProto
-
-            return createContractDataRequestProto(reqId, contract)
+            return _converters.contracts.createContractDataRequestProto(reqId, contract)
 
         if self._tryProto(_M.REQ_CONTRACT_DATA, _proto):
             return
@@ -1098,9 +1160,7 @@ class Client:
 
     def reqMktDepth(self, reqId, contract, numRows, isSmartDepth, mktDepthOptions):
         def _proto():
-            from ._proto.market_data import createMarketDepthRequestProto
-
-            return createMarketDepthRequestProto(
+            return _converters.market_data.createMarketDepthRequestProto(
                 reqId,
                 contract,
                 numRows,
@@ -1133,9 +1193,9 @@ class Client:
 
     def cancelMktDepth(self, reqId, isSmartDepth):
         def _proto():
-            from ._proto.market_data import createCancelMarketDepthProto
-
-            return createCancelMarketDepthProto(reqId, isSmartDepth)
+            return _converters.market_data.createCancelMarketDepthProto(
+                reqId, isSmartDepth
+            )
 
         if self._tryProto(_M.CANCEL_MKT_DEPTH, _proto):
             return
@@ -1143,9 +1203,7 @@ class Client:
 
     def reqNewsBulletins(self, allMsgs):
         def _proto():
-            from ._proto.news import createNewsBulletinsRequestProto
-
-            return createNewsBulletinsRequestProto(allMsgs)
+            return _converters.news.createNewsBulletinsRequestProto(allMsgs)
 
         if self._tryProto(_M.REQ_NEWS_BULLETINS, _proto):
             return
@@ -1153,9 +1211,7 @@ class Client:
 
     def cancelNewsBulletins(self):
         def _proto():
-            from ._proto.news import createCancelNewsBulletinsProto
-
-            return createCancelNewsBulletinsProto()
+            return _converters.news.createCancelNewsBulletinsProto()
 
         if self._tryProto(_M.CANCEL_NEWS_BULLETINS, _proto):
             return
@@ -1163,9 +1219,7 @@ class Client:
 
     def setServerLogLevel(self, logLevel):
         def _proto():
-            from ._proto.rest import createSetServerLogLevelRequestProto
-
-            return createSetServerLogLevelRequestProto(logLevel)
+            return _converters.rest.createSetServerLogLevelRequestProto(logLevel)
 
         if self._tryProto(_M.SET_SERVER_LOGLEVEL, _proto):
             return
@@ -1173,9 +1227,7 @@ class Client:
 
     def reqAutoOpenOrders(self, bAutoBind):
         def _proto():
-            from ._proto.orders import createAutoOpenOrdersRequestProto
-
-            return createAutoOpenOrdersRequestProto(bAutoBind)
+            return _converters.orders.createAutoOpenOrdersRequestProto(bAutoBind)
 
         if self._tryProto(_M.REQ_AUTO_OPEN_ORDERS, _proto):
             return
@@ -1183,9 +1235,7 @@ class Client:
 
     def reqAllOpenOrders(self):
         def _proto():
-            from ._proto.orders import createAllOpenOrdersRequestProto
-
-            return createAllOpenOrdersRequestProto()
+            return _converters.orders.createAllOpenOrdersRequestProto()
 
         if self._tryProto(_M.REQ_ALL_OPEN_ORDERS, _proto):
             return
@@ -1193,28 +1243,27 @@ class Client:
 
     def reqManagedAccts(self):
         def _proto():
-            from ._proto.accounts import createManagedAccountsRequestProto
-
-            return createManagedAccountsRequestProto()
+            return _converters.accounts.createManagedAccountsRequestProto()
 
         if self._tryProto(_M.REQ_MANAGED_ACCTS, _proto):
             return
         self.send(17, 1)
 
     def requestFA(self, faData):
-        # FA Profiles (faData == 2) were de-supported at server gate 177.
-        # IBKR's reference rejects this request locally instead of letting
-        # the server bounce it; mirror that to match wire parity.
+        # FA Profiles (faData == 2) were de-supported at server gate 177:
+        # refuse the request here rather than send one no server answers.
         if (
             self.serverVersion() >= MIN_SERVER_VER_FA_PROFILE_DESUPPORT
             and int(faData) == 2
         ):
-            return
+            raise ValueError(
+                "FA profiles (faDataType 2) are not supported from server "
+                f"version {MIN_SERVER_VER_FA_PROFILE_DESUPPORT}; this one is "
+                f"{self.serverVersion()}"
+            )
 
         def _proto():
-            from ._proto.accounts import createFARequestProto
-
-            return createFARequestProto(faData)
+            return _converters.accounts.createFARequestProto(faData)
 
         if self._tryProto(_M.REQ_FA, _proto):
             return
@@ -1230,16 +1279,14 @@ class Client:
             return
 
         def _proto():
-            from ._proto.accounts import createFAReplaceProto
-
-            return createFAReplaceProto(reqId, faData, cxml)
+            return _converters.accounts.createFAReplaceProto(reqId, faData, cxml)
 
         if self._tryProto(_M.REPLACE_FA, _proto):
             return
         # The trailing ``reqId`` field only exists at server gate 157+
         # (REPLACE_FA_END). Sending it to a sub-157 server desyncs the
-        # frame — IBKR's reference gates this write conditionally.
-        fields: list[Any] = [19, 1, faData, cxml]
+        # frame, so the write is gated.
+        fields: list[WireField] = [19, 1, faData, cxml]
         if self.serverVersion() >= MIN_SERVER_VER_REPLACE_FA_END:
             fields.append(reqId)
         self.send(*fields)
@@ -1258,9 +1305,7 @@ class Client:
         chartOptions,
     ):
         def _proto():
-            from ._proto.historical import createHistoricalDataRequestProto
-
-            return createHistoricalDataRequestProto(
+            return _converters.historical.createHistoricalDataRequestProto(
                 reqId,
                 contract,
                 endDateTime,
@@ -1310,9 +1355,7 @@ class Client:
         professionalCustomer: bool = False,
     ):
         def _proto():
-            from ._proto.rest import createExerciseOptionsRequestProto
-
-            return createExerciseOptionsRequestProto(
+            return _converters.rest.createExerciseOptionsRequestProto(
                 reqId,
                 contract,
                 exerciseAction,
@@ -1326,7 +1369,7 @@ class Client:
 
         if self._tryProto(_M.EXERCISE_OPTIONS, _proto):
             return
-        fields: list[Any] = [
+        fields: list[WireField] = [
             21,
             2,
             reqId,
@@ -1346,8 +1389,7 @@ class Client:
             account,
             override,
         ]
-        # Gated trailers mirror IBKR ``client.py:exerciseOptions`` lines
-        # 1775-1786.  Each field is only written when the connected
+        # Gated trailers: each field is only written when the connected
         # server actually understands it — sending an extra trailer to a
         # pre-180 server desyncs the wire frame.
         if self.serverVersion() >= MIN_SERVER_VER_MANUAL_ORDER_TIME_EXERCISE_OPTIONS:
@@ -1366,9 +1408,7 @@ class Client:
         scannerSubscriptionFilterOptions,
     ):
         def _proto():
-            from ._proto.scanner import createScannerSubscriptionRequestProto
-
-            return createScannerSubscriptionRequestProto(
+            return _converters.scanner.createScannerSubscriptionRequestProto(
                 reqId,
                 subscription,
                 scannerSubscriptionOptions=scannerSubscriptionOptions,
@@ -1408,9 +1448,7 @@ class Client:
 
     def cancelScannerSubscription(self, reqId):
         def _proto():
-            from ._proto.scanner import createCancelScannerSubscriptionProto
-
-            return createCancelScannerSubscriptionProto(reqId)
+            return _converters.scanner.createCancelScannerSubscriptionProto(reqId)
 
         if self._tryProto(_M.CANCEL_SCANNER_SUBSCRIPTION, _proto):
             return
@@ -1418,9 +1456,7 @@ class Client:
 
     def reqScannerParameters(self):
         def _proto():
-            from ._proto.scanner import createScannerParametersRequestProto
-
-            return createScannerParametersRequestProto()
+            return _converters.scanner.createScannerParametersRequestProto()
 
         if self._tryProto(_M.REQ_SCANNER_PARAMETERS, _proto):
             return
@@ -1428,9 +1464,7 @@ class Client:
 
     def cancelHistoricalData(self, reqId):
         def _proto():
-            from ._proto.historical import createCancelHistoricalDataProto
-
-            return createCancelHistoricalDataProto(reqId)
+            return _converters.historical.createCancelHistoricalDataProto(reqId)
 
         if self._tryProto(_M.CANCEL_HISTORICAL_DATA, _proto):
             return
@@ -1438,9 +1472,7 @@ class Client:
 
     def reqCurrentTime(self):
         def _proto():
-            from ._proto.rest import createCurrentTimeRequestProto
-
-            return createCurrentTimeRequestProto()
+            return _converters.rest.createCurrentTimeRequestProto()
 
         if self._tryProto(_M.REQ_CURRENT_TIME, _proto):
             return
@@ -1462,20 +1494,17 @@ class Client:
                 "version >= 213 (protobuf REST messages); current server "
                 f"version is {self._serverVersion}."
             )
-        from ._proto.rest import createCurrentTimeInMillisRequestProto
 
         self.sendProto(
             _M.REQ_CURRENT_TIME_IN_MILLIS,
-            createCurrentTimeInMillisRequestProto().SerializeToString(),
+            _converters.rest.createCurrentTimeInMillisRequestProto().SerializeToString(),
         )
 
     def reqRealTimeBars(
         self, reqId, contract, barSize, whatToShow, useRTH, realTimeBarsOptions
     ):
         def _proto():
-            from ._proto.historical import createRealTimeBarsRequestProto
-
-            return createRealTimeBarsRequestProto(
+            return _converters.historical.createRealTimeBarsRequestProto(
                 reqId,
                 contract,
                 barSize,
@@ -1492,61 +1521,17 @@ class Client:
 
     def cancelRealTimeBars(self, reqId):
         def _proto():
-            from ._proto.historical import createCancelRealTimeBarsProto
-
-            return createCancelRealTimeBarsProto(reqId)
+            return _converters.historical.createCancelRealTimeBarsProto(reqId)
 
         if self._tryProto(_M.CANCEL_REAL_TIME_BARS, _proto):
             return
         self.send(51, 1, reqId)
 
-    def reqFundamentalData(self, reqId, contract, reportType, fundamentalDataOptions):
-        def _proto():
-            from ._proto.scanner import createFundamentalsDataRequestProto
-
-            return createFundamentalsDataRequestProto(
-                reqId,
-                contract,
-                reportType,
-                fundamentalsDataOptions=fundamentalDataOptions,
-            )
-
-        if self._tryProto(_M.REQ_FUNDAMENTAL_DATA, _proto):
-            return
-        options = fundamentalDataOptions or []
-        self.send(
-            52,
-            2,
-            reqId,
-            contract.conId,
-            contract.symbol,
-            contract.secType,
-            contract.exchange,
-            contract.primaryExchange,
-            contract.currency,
-            contract.localSymbol,
-            reportType,
-            len(options),
-            options,
-        )
-
-    def cancelFundamentalData(self, reqId):
-        def _proto():
-            from ._proto.scanner import createCancelFundamentalsDataProto
-
-            return createCancelFundamentalsDataProto(reqId)
-
-        if self._tryProto(_M.CANCEL_FUNDAMENTAL_DATA, _proto):
-            return
-        self.send(53, 1, reqId)
-
     def calculateImpliedVolatility(
         self, reqId, contract, optionPrice, underPrice, implVolOptions
     ):
         def _proto():
-            from ._proto.rest import createCalculateImpliedVolatilityRequestProto
-
-            return createCalculateImpliedVolatilityRequestProto(
+            return _converters.rest.createCalculateImpliedVolatilityRequestProto(
                 reqId,
                 contract,
                 optionPrice,
@@ -1570,9 +1555,7 @@ class Client:
         self, reqId, contract, volatility, underPrice, optPrcOptions
     ):
         def _proto():
-            from ._proto.rest import createCalculateOptionPriceRequestProto
-
-            return createCalculateOptionPriceRequestProto(
+            return _converters.rest.createCalculateOptionPriceRequestProto(
                 reqId,
                 contract,
                 volatility,
@@ -1594,9 +1577,7 @@ class Client:
 
     def cancelCalculateImpliedVolatility(self, reqId):
         def _proto():
-            from ._proto.rest import createCancelCalculateImpliedVolatilityProto
-
-            return createCancelCalculateImpliedVolatilityProto(reqId)
+            return _converters.rest.createCancelCalculateImpliedVolatilityProto(reqId)
 
         if self._tryProto(_M.CANCEL_CALC_IMPLIED_VOLAT, _proto):
             return
@@ -1604,24 +1585,18 @@ class Client:
 
     def cancelCalculateOptionPrice(self, reqId):
         def _proto():
-            from ._proto.rest import createCancelCalculateOptionPriceProto
-
-            return createCancelCalculateOptionPriceProto(reqId)
+            return _converters.rest.createCancelCalculateOptionPriceProto(reqId)
 
         if self._tryProto(_M.CANCEL_CALC_OPTION_PRICE, _proto):
             return
         self.send(57, 1, reqId)
 
     def reqGlobalCancel(self, orderCancel=None):
-        from .order import OrderCancel
-
         if orderCancel is None:
             orderCancel = OrderCancel()
 
         def _proto():
-            from ._proto.orders import createGlobalCancelRequestProto
-
-            return createGlobalCancelRequestProto(
+            return _converters.orders.createGlobalCancelRequestProto(
                 extOperator=orderCancel.extOperator,
                 manualOrderIndicator=orderCancel.manualOrderIndicator,
             )
@@ -1631,7 +1606,7 @@ class Client:
 
         # Binary wire layout: pre-192 carries VERSION=1 prefix; >=192
         # drops VERSION and appends extOperator + manualOrderIndicator.
-        fields: list[Any] = [58]
+        fields: list[WireField] = [58]
         if self.serverVersion() < MIN_SERVER_VER_CME_TAGGING_FIELDS:
             fields.append(1)  # legacy VERSION
         if self.serverVersion() >= MIN_SERVER_VER_CME_TAGGING_FIELDS:
@@ -1640,9 +1615,9 @@ class Client:
 
     def reqMarketDataType(self, marketDataType):
         def _proto():
-            from ._proto.market_data import createMarketDataTypeRequestProto
-
-            return createMarketDataTypeRequestProto(marketDataType)
+            return _converters.market_data.createMarketDataTypeRequestProto(
+                marketDataType
+            )
 
         if self._tryProto(_M.REQ_MARKET_DATA_TYPE, _proto):
             return
@@ -1650,9 +1625,7 @@ class Client:
 
     def reqPositions(self):
         def _proto():
-            from ._proto.accounts import createPositionsRequestProto
-
-            return createPositionsRequestProto()
+            return _converters.accounts.createPositionsRequestProto()
 
         if self._tryProto(_M.REQ_POSITIONS, _proto):
             return
@@ -1660,9 +1633,9 @@ class Client:
 
     def reqAccountSummary(self, reqId, groupName, tags):
         def _proto():
-            from ._proto.accounts import createAccountSummaryRequestProto
-
-            return createAccountSummaryRequestProto(reqId, groupName, tags)
+            return _converters.accounts.createAccountSummaryRequestProto(
+                reqId, groupName, tags
+            )
 
         if self._tryProto(_M.REQ_ACCOUNT_SUMMARY, _proto):
             return
@@ -1670,9 +1643,7 @@ class Client:
 
     def cancelAccountSummary(self, reqId):
         def _proto():
-            from ._proto.accounts import createCancelAccountSummaryProto
-
-            return createCancelAccountSummaryProto(reqId)
+            return _converters.accounts.createCancelAccountSummaryProto(reqId)
 
         if self._tryProto(_M.CANCEL_ACCOUNT_SUMMARY, _proto):
             return
@@ -1680,9 +1651,7 @@ class Client:
 
     def cancelPositions(self):
         def _proto():
-            from ._proto.accounts import createCancelPositionsProto
-
-            return createCancelPositionsProto()
+            return _converters.accounts.createCancelPositionsProto()
 
         if self._tryProto(_M.CANCEL_POSITIONS, _proto):
             return
@@ -1696,9 +1665,7 @@ class Client:
 
     def queryDisplayGroups(self, reqId):
         def _proto():
-            from ._proto.rest import createQueryDisplayGroupsRequestProto
-
-            return createQueryDisplayGroupsRequestProto(reqId)
+            return _converters.rest.createQueryDisplayGroupsRequestProto(reqId)
 
         if self._tryProto(_M.QUERY_DISPLAY_GROUPS, _proto):
             return
@@ -1706,9 +1673,9 @@ class Client:
 
     def subscribeToGroupEvents(self, reqId, groupId):
         def _proto():
-            from ._proto.rest import createSubscribeToGroupEventsRequestProto
-
-            return createSubscribeToGroupEventsRequestProto(reqId, groupId)
+            return _converters.rest.createSubscribeToGroupEventsRequestProto(
+                reqId, groupId
+            )
 
         if self._tryProto(_M.SUBSCRIBE_TO_GROUP_EVENTS, _proto):
             return
@@ -1716,9 +1683,9 @@ class Client:
 
     def updateDisplayGroup(self, reqId, contractInfo):
         def _proto():
-            from ._proto.rest import createUpdateDisplayGroupRequestProto
-
-            return createUpdateDisplayGroupRequestProto(reqId, contractInfo)
+            return _converters.rest.createUpdateDisplayGroupRequestProto(
+                reqId, contractInfo
+            )
 
         if self._tryProto(_M.UPDATE_DISPLAY_GROUP, _proto):
             return
@@ -1726,9 +1693,7 @@ class Client:
 
     def unsubscribeFromGroupEvents(self, reqId):
         def _proto():
-            from ._proto.rest import createUnsubscribeFromGroupEventsRequestProto
-
-            return createUnsubscribeFromGroupEventsRequestProto(reqId)
+            return _converters.rest.createUnsubscribeFromGroupEventsRequestProto(reqId)
 
         if self._tryProto(_M.UNSUBSCRIBE_FROM_GROUP_EVENTS, _proto):
             return
@@ -1736,9 +1701,9 @@ class Client:
 
     def startApi(self):
         def _proto():
-            from ._proto.rest import createStartApiRequestProto
-
-            return createStartApiRequestProto(self.clientId, self.optCapab)
+            return _converters.rest.createStartApiRequestProto(
+                self.clientId, self.optCapab
+            )
 
         if self._tryProto(_M.START_API, _proto):
             return
@@ -1752,9 +1717,9 @@ class Client:
 
     def reqPositionsMulti(self, reqId, account, modelCode):
         def _proto():
-            from ._proto.accounts import createPositionsMultiRequestProto
-
-            return createPositionsMultiRequestProto(reqId, account, modelCode)
+            return _converters.accounts.createPositionsMultiRequestProto(
+                reqId, account, modelCode
+            )
 
         if self._tryProto(_M.REQ_POSITIONS_MULTI, _proto):
             return
@@ -1762,9 +1727,7 @@ class Client:
 
     def cancelPositionsMulti(self, reqId):
         def _proto():
-            from ._proto.accounts import createCancelPositionsMultiProto
-
-            return createCancelPositionsMultiProto(reqId)
+            return _converters.accounts.createCancelPositionsMultiProto(reqId)
 
         if self._tryProto(_M.CANCEL_POSITIONS_MULTI, _proto):
             return
@@ -1772,9 +1735,7 @@ class Client:
 
     def reqAccountUpdatesMulti(self, reqId, account, modelCode, ledgerAndNLV):
         def _proto():
-            from ._proto.accounts import createAccountUpdatesMultiRequestProto
-
-            return createAccountUpdatesMultiRequestProto(
+            return _converters.accounts.createAccountUpdatesMultiRequestProto(
                 reqId, account, modelCode, ledgerAndNLV
             )
 
@@ -1784,9 +1745,7 @@ class Client:
 
     def cancelAccountUpdatesMulti(self, reqId):
         def _proto():
-            from ._proto.accounts import createCancelAccountUpdatesMultiProto
-
-            return createCancelAccountUpdatesMultiProto(reqId)
+            return _converters.accounts.createCancelAccountUpdatesMultiProto(reqId)
 
         if self._tryProto(_M.CANCEL_ACCOUNT_UPDATES_MULTI, _proto):
             return
@@ -1801,9 +1760,7 @@ class Client:
         underlyingConId,
     ):
         def _proto():
-            from ._proto.rest import createSecDefOptParamsRequestProto
-
-            return createSecDefOptParamsRequestProto(
+            return _converters.rest.createSecDefOptParamsRequestProto(
                 reqId,
                 underlyingSymbol,
                 futFopExchange,
@@ -1824,9 +1781,7 @@ class Client:
 
     def reqSoftDollarTiers(self, reqId):
         def _proto():
-            from ._proto.rest import createSoftDollarTiersRequestProto
-
-            return createSoftDollarTiersRequestProto(reqId)
+            return _converters.rest.createSoftDollarTiersRequestProto(reqId)
 
         if self._tryProto(_M.REQ_SOFT_DOLLAR_TIERS, _proto):
             return
@@ -1834,9 +1789,7 @@ class Client:
 
     def reqFamilyCodes(self):
         def _proto():
-            from ._proto.accounts import createFamilyCodesRequestProto
-
-            return createFamilyCodesRequestProto()
+            return _converters.accounts.createFamilyCodesRequestProto()
 
         if self._tryProto(_M.REQ_FAMILY_CODES, _proto):
             return
@@ -1844,9 +1797,7 @@ class Client:
 
     def reqMatchingSymbols(self, reqId, pattern):
         def _proto():
-            from ._proto.rest import createMatchingSymbolsRequestProto
-
-            return createMatchingSymbolsRequestProto(reqId, pattern)
+            return _converters.rest.createMatchingSymbolsRequestProto(reqId, pattern)
 
         if self._tryProto(_M.REQ_MATCHING_SYMBOLS, _proto):
             return
@@ -1854,9 +1805,7 @@ class Client:
 
     def reqMktDepthExchanges(self):
         def _proto():
-            from ._proto.market_data import createMarketDepthExchangesRequestProto
-
-            return createMarketDepthExchangesRequestProto()
+            return _converters.market_data.createMarketDepthExchangesRequestProto()
 
         if self._tryProto(_M.REQ_MKT_DEPTH_EXCHANGES, _proto):
             return
@@ -1864,9 +1813,9 @@ class Client:
 
     def reqSmartComponents(self, reqId, bboExchange):
         def _proto():
-            from ._proto.rest import createSmartComponentsRequestProto
-
-            return createSmartComponentsRequestProto(reqId, bboExchange)
+            return _converters.rest.createSmartComponentsRequestProto(
+                reqId, bboExchange
+            )
 
         if self._tryProto(_M.REQ_SMART_COMPONENTS, _proto):
             return
@@ -1874,9 +1823,7 @@ class Client:
 
     def reqNewsArticle(self, reqId, providerCode, articleId, newsArticleOptions):
         def _proto():
-            from ._proto.news import createNewsArticleRequestProto
-
-            return createNewsArticleRequestProto(
+            return _converters.news.createNewsArticleRequestProto(
                 reqId,
                 providerCode,
                 articleId,
@@ -1889,9 +1836,7 @@ class Client:
 
     def reqNewsProviders(self):
         def _proto():
-            from ._proto.news import createNewsProvidersRequestProto
-
-            return createNewsProvidersRequestProto()
+            return _converters.news.createNewsProvidersRequestProto()
 
         if self._tryProto(_M.REQ_NEWS_PROVIDERS, _proto):
             return
@@ -1908,9 +1853,7 @@ class Client:
         historicalNewsOptions,
     ):
         def _proto():
-            from ._proto.news import createHistoricalNewsRequestProto
-
-            return createHistoricalNewsRequestProto(
+            return _converters.news.createHistoricalNewsRequestProto(
                 reqId,
                 conId,
                 providerCodes,
@@ -1935,9 +1878,7 @@ class Client:
 
     def reqHeadTimeStamp(self, reqId, contract, whatToShow, useRTH, formatDate):
         def _proto():
-            from ._proto.historical import createHeadTimestampRequestProto
-
-            return createHeadTimestampRequestProto(
+            return _converters.historical.createHeadTimestampRequestProto(
                 reqId, contract, useRTH, whatToShow, formatDate
             )
 
@@ -1949,9 +1890,7 @@ class Client:
 
     def reqHistogramData(self, tickerId, contract, useRTH, timePeriod):
         def _proto():
-            from ._proto.historical import createHistogramDataRequestProto
-
-            return createHistogramDataRequestProto(
+            return _converters.historical.createHistogramDataRequestProto(
                 tickerId, contract, bool(useRTH), timePeriod
             )
 
@@ -1961,9 +1900,7 @@ class Client:
 
     def cancelHistogramData(self, tickerId):
         def _proto():
-            from ._proto.historical import createCancelHistogramDataProto
-
-            return createCancelHistogramDataProto(tickerId)
+            return _converters.historical.createCancelHistogramDataProto(tickerId)
 
         if self._tryProto(_M.CANCEL_HISTOGRAM_DATA, _proto):
             return
@@ -1971,9 +1908,7 @@ class Client:
 
     def cancelHeadTimeStamp(self, reqId):
         def _proto():
-            from ._proto.historical import createCancelHeadTimestampProto
-
-            return createCancelHeadTimestampProto(reqId)
+            return _converters.historical.createCancelHeadTimestampProto(reqId)
 
         if self._tryProto(_M.CANCEL_HEAD_TIMESTAMP, _proto):
             return
@@ -1983,24 +1918,24 @@ class Client:
         """Cancel an in-flight reqContractDetails. Protobuf-only —
         IBKR ships no binary form (gate 215, MIN_SERVER_VER_CANCEL_CONTRACT_DATA).
         """
-        from ._pb_msgids import CANCEL_CONTRACT_DATA
-        from ._proto.historical import createCancelContractDataProto
 
         self.sendProto(
-            CANCEL_CONTRACT_DATA,
-            createCancelContractDataProto(reqId).SerializeToString(),
+            _M.CANCEL_CONTRACT_DATA,
+            _converters.historical.createCancelContractDataProto(
+                reqId
+            ).SerializeToString(),
         )
 
     def cancelHistoricalTicks(self, reqId):
         """Cancel an in-flight reqHistoricalTicks. Protobuf-only
         (gate 215, MIN_SERVER_VER_CANCEL_CONTRACT_DATA shares the gate).
         """
-        from ._pb_msgids import CANCEL_HISTORICAL_TICKS
-        from ._proto.historical import createCancelHistoricalTicksProto
 
         self.sendProto(
-            CANCEL_HISTORICAL_TICKS,
-            createCancelHistoricalTicksProto(reqId).SerializeToString(),
+            _M.CANCEL_HISTORICAL_TICKS,
+            _converters.historical.createCancelHistoricalTicksProto(
+                reqId
+            ).SerializeToString(),
         )
 
     def reqConfig(self, reqId):
@@ -2009,10 +1944,11 @@ class Client:
         ``ConfigResponse`` carrying nested LockAndExitConfig /
         ApiConfig / MessageConfig / OrdersConfig sub-messages.
         """
-        from ._pb_msgids import REQ_CONFIG
-        from ._proto.rest import createConfigRequestProto
 
-        self.sendProto(REQ_CONFIG, createConfigRequestProto(reqId).SerializeToString())
+        self.sendProto(
+            _M.REQ_CONFIG,
+            _converters.rest.createConfigRequestProto(reqId).SerializeToString(),
+        )
 
     def updateConfig(
         self,
@@ -2028,12 +1964,10 @@ class Client:
         (gate 221, MIN_SERVER_VER_UPDATE_CONFIG). Server replies
         with ``UpdateConfigResponse`` carrying status + changed-fields list.
         """
-        from ._pb_msgids import UPDATE_CONFIG
-        from ._proto.rest import createUpdateConfigRequestProto
 
         self.sendProto(
-            UPDATE_CONFIG,
-            createUpdateConfigRequestProto(
+            _M.UPDATE_CONFIG,
+            _converters.rest.createUpdateConfigRequestProto(
                 reqId,
                 lockAndExit=lockAndExit,
                 messages=messages,
@@ -2046,9 +1980,7 @@ class Client:
 
     def reqMarketRule(self, marketRuleId):
         def _proto():
-            from ._proto.rest import createMarketRuleRequestProto
-
-            return createMarketRuleRequestProto(marketRuleId)
+            return _converters.rest.createMarketRuleRequestProto(marketRuleId)
 
         if self._tryProto(_M.REQ_MARKET_RULE, _proto):
             return
@@ -2056,9 +1988,7 @@ class Client:
 
     def reqPnL(self, reqId, account, modelCode):
         def _proto():
-            from ._proto.scanner import createPnLRequestProto
-
-            return createPnLRequestProto(reqId, account, modelCode)
+            return _converters.scanner.createPnLRequestProto(reqId, account, modelCode)
 
         if self._tryProto(_M.REQ_PNL, _proto):
             return
@@ -2066,9 +1996,7 @@ class Client:
 
     def cancelPnL(self, reqId):
         def _proto():
-            from ._proto.scanner import createCancelPnLProto
-
-            return createCancelPnLProto(reqId)
+            return _converters.scanner.createCancelPnLProto(reqId)
 
         if self._tryProto(_M.CANCEL_PNL, _proto):
             return
@@ -2076,9 +2004,9 @@ class Client:
 
     def reqPnLSingle(self, reqId, account, modelCode, conid):
         def _proto():
-            from ._proto.scanner import createPnLSingleRequestProto
-
-            return createPnLSingleRequestProto(reqId, account, modelCode, conid)
+            return _converters.scanner.createPnLSingleRequestProto(
+                reqId, account, modelCode, conid
+            )
 
         if self._tryProto(_M.REQ_PNL_SINGLE, _proto):
             return
@@ -2086,9 +2014,7 @@ class Client:
 
     def cancelPnLSingle(self, reqId):
         def _proto():
-            from ._proto.scanner import createCancelPnLSingleProto
-
-            return createCancelPnLSingleProto(reqId)
+            return _converters.scanner.createCancelPnLSingleProto(reqId)
 
         if self._tryProto(_M.CANCEL_PNL_SINGLE, _proto):
             return
@@ -2107,9 +2033,7 @@ class Client:
         miscOptions,
     ):
         def _proto():
-            from ._proto.historical import createHistoricalTicksRequestProto
-
-            return createHistoricalTicksRequestProto(
+            return _converters.historical.createHistoricalTicksRequestProto(
                 reqId,
                 contract,
                 startDateTime,
@@ -2139,9 +2063,7 @@ class Client:
 
     def reqTickByTickData(self, reqId, contract, tickType, numberOfTicks, ignoreSize):
         def _proto():
-            from ._proto.market_data import createTickByTickRequestProto
-
-            return createTickByTickRequestProto(
+            return _converters.market_data.createTickByTickRequestProto(
                 reqId, contract, tickType, numberOfTicks, ignoreSize
             )
 
@@ -2151,9 +2073,7 @@ class Client:
 
     def cancelTickByTickData(self, reqId):
         def _proto():
-            from ._proto.market_data import createCancelTickByTickProto
-
-            return createCancelTickByTickProto(reqId)
+            return _converters.market_data.createCancelTickByTickProto(reqId)
 
         if self._tryProto(_M.CANCEL_TICK_BY_TICK_DATA, _proto):
             return
@@ -2161,9 +2081,7 @@ class Client:
 
     def reqCompletedOrders(self, apiOnly):
         def _proto():
-            from ._proto.orders import createCompletedOrdersRequestProto
-
-            return createCompletedOrdersRequestProto(apiOnly)
+            return _converters.orders.createCompletedOrdersRequestProto(apiOnly)
 
         if self._tryProto(_M.REQ_COMPLETED_ORDERS, _proto):
             return
@@ -2171,9 +2089,7 @@ class Client:
 
     def reqWshMetaData(self, reqId):
         def _proto():
-            from ._proto.news import createWshMetaDataRequestProto
-
-            return createWshMetaDataRequestProto(reqId)
+            return _converters.news.createWshMetaDataRequestProto(reqId)
 
         if self._tryProto(_M.REQ_WSH_META_DATA, _proto):
             return
@@ -2181,9 +2097,7 @@ class Client:
 
     def cancelWshMetaData(self, reqId):
         def _proto():
-            from ._proto.news import createCancelWshMetaDataProto
-
-            return createCancelWshMetaDataProto(reqId)
+            return _converters.news.createCancelWshMetaDataProto(reqId)
 
         if self._tryProto(_M.CANCEL_WSH_META_DATA, _proto):
             return
@@ -2191,9 +2105,7 @@ class Client:
 
     def reqWshEventData(self, reqId, data: WshEventData):
         def _proto():
-            from ._proto.news import createWshEventDataRequestProto
-
-            return createWshEventDataRequestProto(reqId, data)
+            return _converters.news.createWshEventDataRequestProto(reqId, data)
 
         if self._tryProto(_M.REQ_WSH_EVENT_DATA, _proto):
             return
@@ -2211,9 +2123,7 @@ class Client:
 
     def cancelWshEventData(self, reqId):
         def _proto():
-            from ._proto.news import createCancelWshEventDataProto
-
-            return createCancelWshEventDataProto(reqId)
+            return _converters.news.createCancelWshEventDataProto(reqId)
 
         if self._tryProto(_M.CANCEL_WSH_EVENT_DATA, _proto):
             return
@@ -2221,9 +2131,7 @@ class Client:
 
     def reqUserInfo(self, reqId):
         def _proto():
-            from ._proto.rest import createUserInfoRequestProto
-
-            return createUserInfoRequestProto(reqId)
+            return _converters.rest.createUserInfoRequestProto(reqId)
 
         if self._tryProto(_M.REQ_USER_INFO, _proto):
             return

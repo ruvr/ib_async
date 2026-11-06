@@ -8,17 +8,17 @@ Version 3.0.0 (Unreleased)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The v3.0 release lands the protobuf wire-protocol migration, shifts
-financial numerics to ``Decimal | None`` end-to-end, and closes the
-IBKR-parity gap against the reference client at TWS / Gateway server
-version 225. The full upgrade guide with examples lives at
-``docs/migration/v3.md``.
+financial numerics to ``Decimal | None`` end-to-end, and conforms to
+IBKR's protocol for TWS API 10.51 (TWS / Gateway server version 226).
+The full upgrade guide with examples lives at ``docs/migration/v3.md``.
 
 **The most likely-to-hit changes**
 
 * Financial numeric fields are now ``Decimal | None`` (was ``float``).
 * ``commission`` is now ``commissionAndFees`` on ``CommissionReport``
-  and ``OrderState``. The legacy name keeps working with a
-  ``DeprecationWarning`` until v4.0.
+  and ``OrderState``. The legacy attribute keeps working with a
+  ``DeprecationWarning`` until v4.0 (the constructors take only
+  ``commissionAndFees=``).
 * ``HistogramData.count`` is renamed to ``HistogramData.size`` and
   retyped to ``Decimal | None``.
 * ``PnLSingle.position`` is now ``Decimal | None`` (was ``int``).
@@ -30,6 +30,8 @@ version 225. The full upgrade guide with examples lives at
   (``av[1]``) and tuple iteration no longer work. Use attribute
   access (``av.tag``). ``_asdict()`` / ``_replace()`` are replaced by
   ``dataclasses.asdict()`` / ``dataclasses.replace()``.
+* ``reqFundamentalData`` and ``Ticker.fundamentalRatios`` are removed:
+  IBKR no longer serves fundamental data through the TWS API.
 
 **Added**
 
@@ -39,8 +41,7 @@ version 225. The full upgrade guide with examples lives at
   gate. Per-message gating means a server at version 207 uses
   protobuf for accounts but binary for historical data, etc. The
   binary path remains fully supported for older server versions.
-* **14 new public methods on** ``IB`` **for parity with IBKR's
-  reference** ``EClient``:
+* **14 new public methods on** ``IB``:
 
   * ``IB.reqCurrentTimeInMillisAsync`` (server >= 213)
   * ``IB.setServerLogLevel``
@@ -54,6 +55,71 @@ version 225. The full upgrade guide with examples lives at
   * ``IB.cancelHistoricalTicks`` (protobuf-only, server >= 215; settles awaiter)
   * ``IB.reqConfigAsync``, ``IB.updateConfigAsync`` (protobuf-only, server >= 219)
 
+* **``IB.connect`` and ``connectAsync`` are annotated ``-> Self``**, so
+  ``ib = IB().connect(...)`` type-checks. (:issue:`215`, thanks to
+  @jchaffraix)
+* **``IB.exerciseOptions``** takes ``manualOrderTime``, ``customerAccount``
+  and ``professionalCustomer``, which the request already carried.
+  (:issue:`166`, thanks to @li-plus)
+* **39 order types** in ``ib_async.ordertypes``, one constructor each, from
+  Market on Close, Limit on Open and Trailing Stop to Midprice, the Snap
+  types, the IBKR ATS pegs and the combo types, generated with their
+  documentation from one catalog. Each validates its values (an action
+  IBKR takes, required values given, prices and quantities finite
+  numbers); ``specOf(order)`` names the type of any ``Order`` (and
+  ``specsOf`` every type of one combining types), and
+  ``checkOrder(contract, order)`` lists what IBKR documents against an
+  order for a contract. IB algos work the order types they apply to:
+  ``LimitOrder("BUY", 100, 50.00, algo=Adaptive(priority="Urgent"))``, typed
+  and checked (Adaptive refuses a GTC order); combo orders take
+  ``routing=ComboRouting(nonGuaranteed=True)``, and stops
+  ``adjust=AdjustToTrail(...)`` for a one-time adjustment; ``FxHedgeOrder``
+  attaches an FX hedge. Given ``ContractDetails``, ``checkOrder`` also
+  names an order type its ``orderTypes`` does not list (in any of IBKR's
+  spellings), and ``modifiedOrder(trade.order, lmtPrice=...)`` prepares a
+  live order for modification as live trading found IBKR requires (an
+  algo order's ``IBALGO`` sent as LMT, the fields TWS fills in reset,
+  parentId cleared unless kept, never below the filled quantity). The docs
+  page also covers the order options (time in force, cash quantity,
+  overnight, CME tagging, ...) and every IBKR order type code, built or
+  why not. (:issue:`14`, :issue:`109`, thanks to @flepied and @maxicus)
+* **``IB.reqPositionsMulti(account, modelCode)``** (and its async sibling)
+  returns the positions of an account, advisor group or model, each with
+  the new ``Position.modelCode``. A model's share of a position is not
+  added to ``positions()``. (:issue:`41`, :issue:`25`, thanks to @paramkr2)
+* **``IB.reqOptionStrikes(underlying, *months)``** (and its async sibling)
+  returns the strikes each expiration of a stock's or future's options
+  actually lists, as ``OptionStrikes`` per expiration, trading class,
+  multiplier and underlying contract, where ``reqSecDefOptParams`` gives
+  every strike crossed with every expiration. The option chain example
+  notebook now walks through futures options with it. (:issue:`38`,
+  thanks to @ilan-pinto, @maqifrnswa and @westonplatter)
+* **Typed data request values** in ``ib_async.datarequests``: ``whatToShow``
+  and ``barSizeSetting`` of the historical, real-time and tick data
+  requests accept exactly the values IBKR documents for each request, as
+  plain strings or as members of the ``WhatToShow`` and ``BarSize``
+  enums, so a type checker catches a typo. ``durationStr`` is checked
+  before a request is sent (``checkDuration``), with a message naming the
+  units. (:issue:`114`, thanks to @totkeks and @gnzsnz)
+* **Bars from live ticks are ``RealTimeBar``s, with ``wap``.**
+  ``timebars``, ``tickbars`` and ``volumebars`` build the same bar type
+  IBKR's real-time bars use, ``Decimal``-valued, now with each bar's
+  volume-weighted average price, kept in constant time per tick (and
+  ``None`` for a bar without volume, such as a midpoint bar). All three
+  share one builder and one event contract: each emits its completed bars,
+  and ``bars.updateEvent(bars, hasNewBar)`` fires True on each completion
+  and False whenever the bar in progress otherwise changes. A completed
+  bar never changes, and is a frozen ``RealTimeBar``. Their ``bars`` keeps
+  every bar, or with ``maxBars=`` at most that many completed bars besides
+  the one in progress, the oldest dropped. Ticks without a finite price
+  (midpoints without a bid and ask, which used to fail the aggregation)
+  are skipped; a time bar before any tick is no bar, and a time bar's
+  naive timer time is taken as local time. An operator ends with its
+  source (and a time bar operator with its timer).
+  ``examples/programs/live_bars.py`` and a recipe show indicators on the
+  bars (a session VWAP and an EMA) as running folds.
+  ``RealTimeBar.open_`` is now ``open``, as on ``BarData``.
+  (:issue:`127`, thanks to @gnzsnz, and @pavel-slama for the review)
 * **Attached-order linkage on** ``Order``: new ``slOrderId`` /
   ``slOrderType`` / ``ptOrderId`` / ``ptOrderType`` fields preserve
   the stop-loss and profit-target ids of a bracket or OCO group
@@ -90,6 +156,44 @@ version 225. The full upgrade guide with examples lives at
   Previously they were populated on receive but silently dropped on
   send — a fetched-then-replaced order lost its originating-session
   tagging.
+* **``Order.conditionsIncludeOvernight``** (TWS API 10.50): lets an
+  order's conditions also evaluate during the overnight session. Sent
+  and received on the protobuf order path; ``False`` stays off the
+  wire.
+* **``ContractDetails.settlementMethod``** (TWS API 10.49): how the
+  contract settles on expiry, ``"Physical"`` or ``"Cash"``.
+* **``Execution.submitter``** (server version 198+): the identity of
+  the user who submitted the order, decoded on the binary and protobuf
+  paths.
+* **``Ticker.dom``**, a :class:`DepthBook` holding both sides of the
+  market-depth book; ``DepthOperation`` names the insert / update /
+  delete row operations.
+* **Examples** under ``examples/``: reference programs
+  (``download_bars.py``, ``stream_quotes.py``, ``order_lifecycle.py``),
+  typed and async, with their logic tested without a server; and a
+  `marimo <https://marimo.io>`_ notebook for each topic of the Jupyter
+  notebooks, using the async API without ``util.startLoop()``.
+  ``make examples-check`` lints, type-checks and structure-checks them in
+  CI. The Jupyter notebooks stay in ``notebooks/`` for comparison and
+  will be removed.
+* **``IB.runtimeState()``**, the client's state for metrics and debugging,
+  as frozen records (``ib_async.runtime``): the connection, the current
+  connection's traffic and request pacing, the requests waiting for an
+  answer and the live subscriptions by kind, and counters totalled since
+  the IB was created: connects and disconnects, frames and bytes, throttling,
+  undecodable and unknown messages, each request counted once by how it
+  ended (answered, refused, failed, abandoned, cancelled with IBKR, not
+  sent, ended by a disconnect), subscriptions, and errors and warnings by
+  code. Counting adds no work per market data tick.
+* **``IB.requestTimeoutEvent``** emits a ``TimedOutRequest`` (the method,
+  its time limit, the reqId and the contract) when a request's time limit
+  passes: ``reqHistoricalDataAsync``, ``reqHistoricalScheduleAsync``,
+  ``reqHistoricalNewsAsync``, ``reqMatchingSymbolsAsync``,
+  ``reqMarketRuleAsync``, ``requestFAAsync``, the ``calculate*Async``
+  methods, and the requests ``connect`` makes at startup. These calls still
+  return what they returned before (an empty result, or None), so the
+  event is how a program tells a timeout from an empty answer. Counted in
+  ``Counters.requestsTimedOut``.
 
 **Changed (breaking)**
 
@@ -100,10 +204,29 @@ version 225. The full upgrade guide with examples lives at
   ``PnLSingle``. ``None`` is the unset sentinel —
   ``Decimal('NaN')`` is never used (it is silently truthy in Python
   and corrupted downstream comparisons).
+* **``IBC`` needs ``twsVersion``**: it has no default, so ``IBC()``
+  raises ``TypeError``; pass it first, ``IBC(1019)`` or ``IBC("10.19")``
+  (see Fixed). IBC's start script could not run without it.
+* **No more methods patched onto classes at import.** Importing
+  ib_async added ``dict()``, ``tuple()``, ``update()`` and
+  ``nonDefaults()`` to every ib_async dataclass. They are gone: use
+  ``util.dataclassAsDict(obj)``, ``util.dataclassAsTuple(obj)`` and
+  ``util.dataclassNonDefaults(obj)``. ``update()`` and
+  ``util.dataclassUpdate``, which changed an object in place through its
+  ``__dict__`` (and failed on the slotted classes, which have none), are
+  gone too: set the attributes (``contract.exchange = "SMART"``), which
+  changes the object in place as they did. ``dataclasses.replace`` makes
+  a copy instead, and raises on the ``Contract`` subclasses; migration
+  guide section 6e has each replacement.
+* **``RealTimeBar`` is frozen, and its ``open_`` is ``open``**, as on
+  ``BarData``: the bars of ``reqRealTimeBars`` and of the bar operators
+  cannot be changed once handed out, and code reading or assigning
+  ``bar.open_`` needs ``bar.open`` (assigning needs
+  ``dataclasses.replace``).
 * **``commission`` → ``commissionAndFees``** on ``CommissionReport``
-  and ``OrderState``. Matches IBKR's reference. Legacy ``commission``
-  attribute and constructor keyword keep working with
-  ``DeprecationWarning`` until v4.0.
+  and ``OrderState``. The legacy ``commission`` attribute keeps
+  working with ``DeprecationWarning`` until v4.0; the constructors take
+  ``commissionAndFees=`` only.
 * **``HistogramData.count: int`` → ``HistogramData.size: Decimal | None``**
   — the field was the wrong name and the wrong type. ``count`` was
   always a Decimal-encoded quantity on the wire; the legacy name
@@ -126,9 +249,12 @@ version 225. The full upgrade guide with examples lives at
   ``dataclasses.asdict()`` / ``dataclasses.replace()``.
 * **``tickByTick*.time``** now uses the wire-supplied exchange epoch
   instead of the local-clock ``lastTime``.
-* **``Wrapper.sendMsg``** signature changed from ``str`` to
+* **``Trade.filled()`` / ``Trade.remaining()``** return ``Decimal``
+  (were ``float``), matching the ``Decimal`` share quantities they sum.
+  ``filled()`` is ``Decimal(0)`` when nothing has filled.
+* **``Client.sendMsg``** signature changed from ``str`` to
   ``bytes | None``. Subclassers must update.
-* **``Client.MaxClientVersion = 225``** (was 178). The 178 cap
+* **``Client.MaxClientVersion = 226``** (was 178). The 178 cap
   silently disabled every gate 201+ feature on v2.x against modern
   TWS / Gateway — no v2.x deployment could reach protobuf.
 * **Cancel-async methods raise ``CancelledError``** on the awaiter
@@ -141,25 +267,347 @@ version 225. The full upgrade guide with examples lives at
   fields as raw wire strings.
 * **``RealTimeBar.endTime`` removed.** The field was never populated
   from the wire (IBKR's ``RealTimeBarTick`` proto has only
-  ``time`` / OHLC / volume / WAP / count, and their reference Python
-  has no such field) and the wrapper hardcoded ``-1``. If you need
+  ``time`` / OHLC / volume / WAP / count) and the wrapper hardcoded
+  ``-1``. If you need
   an end-of-window timestamp, compute it from ``bar.time``
   (5-second windows).
 * **Universal-unset-is-None sweep**: every magic-value default in
   the domain dataclasses (``UNSET_INTEGER`` / ``UNSET_DOUBLE`` /
   ``UNSET_LONG`` / ``UNSET_DECIMAL`` / ``nan``) replaced with
   ``T | None = None``. Affected: ``Order`` (~25 fields),
-  ``OrderStateNumeric`` (18 fields), ``Ticker`` (80 fields), ``Bar``
-  (4 fields), ``PnL`` / ``PnLSingle`` (7 fields),
+  ``OrderStateNumeric`` (18 fields), ``Ticker`` (80 fields),
+  ``RealTimeBar`` (which replaced ``ticker.Bar``), ``PnL`` / ``PnLSingle`` (7 fields),
   ``ScannerSubscription``, ``ExecutionFilter``,
   ``ContractDetails.aggGroup``. Readers updated from
   ``isNan(x)`` / ``x == UNSET_*`` to ``x is None``.
+* **``Ticker.domBids`` / ``domAsks``** are now read-only snapshots
+  (``Sequence[DOMLevel]``, best price first) of ``Ticker.dom`` instead
+  of the book's own lists, so nothing done to a returned value can
+  corrupt the book. Code that sorted or edited them in place should copy
+  first (``list(ticker.domBids)``). ``domBidsDict`` / ``domAsksDict`` are
+  likewise snapshots (``Mapping[int, DOMLevel]``) keyed by row. None of
+  the four are ``Ticker(...)`` constructor arguments any more; assigning
+  ``ticker.domBids = rows`` still replaces that side's rows.
+* **Order types are constructors that return ``Order``.** ``MarketOrder``,
+  ``LimitOrder``, ``StopOrder`` and ``StopLimitOrder`` were ``Order``
+  subclasses; they are now functions in ``ib_async.ordertypes`` (exported
+  from ``ib_async``, no longer from ``ib_async.order``) returning a plain
+  ``Order``, so ``dataclasses.replace`` works on them, ``repr`` shows
+  ``orderType``, and ``isinstance(order, LimitOrder)`` no longer applies:
+  use ``order.orderType`` or ``ordertypes.specOf(order)``. Construction is
+  validated (``OrderTypeError``). See ``docs/migration/v3.md`` section 6a.
+* **polars replaces pandas.** ``util.df()`` and ``FlexReport.df()``
+  return a polars ``DataFrame`` (polars 2.0+, installed with
+  ``pip install "ib_async[polars]"``), and ``util.barplot()`` accepts
+  one. ``Decimal`` and time-zone-aware ``datetime`` values keep their
+  types; an ib_async object in a field (``Position.contract``) is stored
+  as itself. ``labels`` keeps those columns in that order, and an unknown
+  label raises instead of being ignored. No objects give an empty
+  DataFrame instead of ``None``. ``frame.to_pandas()`` converts where
+  pandas is still needed (it requires pandas and pyarrow). polars runs
+  on CPython only; on PyPy, ``util.pandasDf()`` builds a pandas DataFrame
+  the same way (pandas is not a dependency: install it yourself).
+* **The empty values of ``IBDefaults`` can be any value, and are typed.**
+  ``emptyPrice``, ``emptySize`` and ``unset`` take a number (IBKR's -1
+  and 0, NaN), None, an enum member or any other sentinel. ``IBDefaults``,
+  ``IB``, ``Ticker``, ``TickData`` and ``TickByTickAllLast`` are generic
+  over ``EmptyT``, the type of the empty values that are not numbers,
+  which is None by default: ``IB(IBDefaults(emptyPrice=Missing.PRICE))``
+  is an ``IB[Missing]`` and its tickers' ``bid`` is
+  ``float | Missing | None``. A bare ``IB`` or ``Ticker`` means
+  ``EmptyT = None``, as before. ``IBDefaults`` is frozen; build a new
+  one to change a value. Python before 3.13 installs
+  ``typing_extensions`` for the type parameter's default.
+* **ib_async reads a value as a number only through
+  ``IBDefaults.isPrice`` and ``isSize``**: a finite number that is not an
+  empty value. ``Ticker.hasBidAsk``, ``midpoint`` and ``marketPrice``
+  use them instead of comparing with -1, so with ``emptyPrice=None`` a
+  bid of -1 (a spread can quote it) is a price. ``marketPrice`` returns
+  None, not an empty value, when there is no price. The tick filters
+  (``updateEvent.trades()``, ``bids()`` and the rest) emit None for an
+  empty price or size, as ``midpoints()`` does for a missing midpoint.
+* **``Ticker.ticks`` logs a tick only when it carries a price or a size
+  other than 0**, whatever the empty values are. A side emptied (size 0)
+  is no longer logged as a ``TickData(-1, 0)`` placeholder with the
+  default values; with ``emptyPrice=None`` it never was.
+
+**Removed**
+
+* Fundamental data. IBKR de-supported it in TWS API 10.47 and removed
+  every message for it, so ``IB.reqFundamentalData`` /
+  ``reqFundamentalDataAsync``, ``Client.reqFundamentalData`` /
+  ``cancelFundamentalData``, ``Ticker.fundamentalRatios`` (generic
+  tick ``258``) and ``FundamentalRatios`` are gone. TWS offers no
+  replacement; the Wall Street Horizon calls
+  (``reqWshMetaData`` / ``reqWshEventData``) cover corporate events
+  but not financial statements or ratios.
 
 **Fixed (silent-data-loss and wire-protocol bugs)**
 
 These were broken on v2.x against modern TWS / Gateway versions and
 are fixed in v3.0:
 
+* **A refused modification marked a live order Cancelled.** TWS reports a
+  refused modification as an error and sends no status, and the order
+  keeps working on its old terms. The trade became ``Cancelled``, fired
+  ``cancelledEvent`` and left ``openTrades()``, so an application could
+  place a replacement beside the live order. Errors 104, 134, 201, 422,
+  439, 440, 441, 442, 443, 444, 10241 and 10242 are now warnings for an
+  order modified after TWS acknowledged it (``Trade.modifyUnconfirmed``).
+  They end any other order as before. TWS does not confirm a modification,
+  so this holds for the rest of the order's life. The trade stays active
+  as ``ValidationError`` until its next status. A status that ends the
+  order still ends the trade, and ``Cancelled`` or ``Inactive`` then fires
+  ``cancelledEvent``. (:issue:`243`, thanks to @nealeyoung)
+* **A repeated commission report fired its events twice.** TWS repeats
+  an execution and its commission report, for instance after a
+  reconnect. The repeated execution was already ignored. The repeated
+  report fired ``commissionReportEvent`` again, so a handler that summed
+  commissions counted them twice. A report equal to the one already on
+  the fill is now ignored.
+* **A what-if reply without margins raised in the handler.** On the
+  protobuf path, TWS omits an unset optional field instead of sending
+  the unset double. The what-if branch of ``openOrder`` called
+  ``float()`` on the resulting empty string. A what-if preview could
+  then raise and leave ``whatIfOrder`` waiting. An empty margin now
+  means "no margins yet", the same as the unset double.
+* **A malformed RT volume tick left the Ticker partly updated.** For an
+  RT volume string with an unreadable time field, ``rtVolume`` and
+  ``vwap`` were set before parsing the time raised. Every part is now
+  parsed before any part is assigned.
+* **A historical news row with an unreadable time lost the whole
+  answer.** The first such row raised in ``historicalNews``. The row is
+  now dropped and an error is logged. The request completes with the
+  other rows.
+* **``Watchdog.stop()`` did not end the startup or retry wait.** The
+  wait ran to its end. The Watchdog then connected once more to the app
+  it had been told to stop, terminated it again and fired
+  ``stoppedEvent`` twice. With the default settings, this was a 30
+  second window after every stop. The wait now ends at once.
+  ``Watchdog`` also takes its ``sleep`` function as a field, so tests
+  drive it without a clock.
+* **``util.parseIBDatetime`` accepted values it could not read.** An
+  unknown time zone name or an epoch outside the datetime range now
+  raises ``ValueError``. Before, it produced a wrong value or one that
+  failed later. ``reqHeadTimeStampAsync`` reports the error as the
+  request's error.
+* **``FlexReport.load`` on a file that is not XML** now raises
+  ``FlexError`` instead of an XML parser error.
+* **``Execution.time`` off by the host's or TimezoneTWS's UTC offset.**
+  TWS reports execution times as ``YYYYmmdd-HH:MM:SS``, IBKR's zone-less
+  UTC form, which was read as TimezoneTWS or host-local time; it is now
+  UTC (``util.parseIBDatetime`` returns it UTC-aware). The gateway's
+  configured time zone does not change this form. (:issue:`230`,
+  :issue:`232`, thanks to @giorgi1324)
+* **Qualified contracts with a hyphenated time zone were rejected.** A
+  last trade date such as ``20250331 19:30:00 GB-Eire`` was split on the
+  zone's hyphen, so ``qualifyContracts`` wrote ``20250331 19:30:00 GB``
+  back to the contract and TWS refused the order (error 10330). Values
+  with whitespace now split on whitespace, on the binary and protobuf
+  paths (``util.splitIBLastTradeDate``). (:issue:`120`)
+* **Different spreads sharing a combo conId got one ticker.** IBKR
+  reports the same conId (such as ``28812380``) on many BAG contracts;
+  market data was indexed by that conId before the bag's legs, so a
+  second spread got the first one's ticker and subscription. Bags are now
+  identified by their legs, as they hash, and ``Contract.__eq__`` no
+  longer counts two bags equal for their shared combo conId: it compares
+  them on every field. (:issue:`236`)
+* **A continuous future shared its front future's market data.** A
+  CONTFUT has its front contract's conId; market data was indexed by
+  that conId, so ``reqMktData`` for the future after the CONTFUT returned
+  the CONTFUT's ticker, and ``cancelMktData`` for one cancelled the
+  other's stream. Each now has its own subscription and ticker, and
+  ``Contract.__eq__`` no longer counts a CONTFUT equal to the contract
+  whose conId it shares (they never hashed alike).
+* **``portfolio()`` was silently empty with several managed accounts.**
+  IBKR streams portfolio updates for one account at a time, and with
+  several accounts and no ``connect(account=...)`` none was subscribed.
+  ``connect`` now logs this, and ``portfolio()`` and ``connect``
+  document how to choose the account (``positions()`` covers every
+  account). (:issue:`72`, :issue:`165`)
+* **``connect`` requested positions whatever ``fetchFields`` said**;
+  ``StartupFetch.POSITIONS`` now controls it like the other fields.
+  (:issue:`84`)
+* **``connect`` waited out its timeout when TWS refused the connection.**
+  For a client id already in use, TWS sends error 326 and closes the
+  socket. ``connect`` kept waiting for the API to start, and with
+  ``timeout=0`` it waited forever. A close before the API starts now
+  raises ``ConnectionError`` at once, with the server's error as the
+  message: ``Error 326: Unable to connect as the client id is already in
+  use. Retry with a unique client id.`` A server too old for the client
+  and a ``disconnect()`` during the connect raise it too. (:issue:`242`,
+  thanks to @daniel-debrun)
+* **A disconnect reported dropped requests as errors.** When a disconnect
+  failed a request whose caller no longer held its future, the event loop
+  reported "Future exception was never retrieved". An interactive app,
+  such as one built on prompt_toolkit, shows that as a crash. The
+  disconnect is reported once, by ``disconnectedEvent``, and the requests
+  it ends report nothing more. A caller still awaiting a request gets
+  ``ConnectionError``.
+* **A rejected stream argument left a dead subscription.** When the
+  encoder refused an argument, such as ``reqMktData(contract, 233)`` for
+  ``"233"``, the call raised and sent nothing, but its subscription stayed
+  registered until the next disconnect. The corrected call then returned
+  that subscription's Ticker without sending a request, and the Ticker
+  never updated. ``reqMktData``, ``reqTickByTickData``, ``reqMktDepth``,
+  ``reqRealTimeBars``, ``reqPnL``, ``reqPnLSingle`` and
+  ``reqScannerSubscription`` now remove the subscription when their send
+  raises, and a Ticker created for that call, which never subscribed, is
+  not listed by ``ib.tickers()``.
+* **A rejected request argument left the request open.** A request such
+  as ``reqContractDetailsAsync``, ``reqHistoricalDataAsync`` or
+  ``whatIfOrderAsync`` whose argument the encoder refused raised and sent
+  nothing, but stayed registered until the next disconnect; with
+  ``keepUpToDate=True`` its bars stayed in ``ib.realtimeBars()``. A refused
+  contract in ``reqTickersAsync`` left the snapshot subscriptions of every
+  contract registered. These requests are now cancelled when their send
+  raises, and ``reqTickersAsync`` removes its snapshot subscriptions.
+* **A stream IBKR refused stayed registered.** After an error such as 354
+  (not subscribed) or 200 (no security definition) for ``reqMktData``,
+  ``reqTickByTickData``, ``reqMktDepth`` or another stream, IBKR serves
+  nothing for it, but its subscription stayed. A later request for the
+  contract, after fixing the subscription, was deduplicated onto it: it
+  sent nothing and returned a Ticker that never updated. The errors IBKR
+  documents as ending a request (101, 200, 309, 316, 354, 10089, 10186) now
+  end the subscription, without a cancel; the Ticker keeps its data, and
+  the next request is sent and updates the same Ticker. Errors after which
+  the stream goes on (such as 10090, 10167 or 10197) leave it as it was.
+* **A snapshot IBKR served in part ended early.** 10090 and 10091 say that
+  part of the requested market data is not subscribed; IBKR still sends the
+  rest and ends the snapshot with ``tickSnapshotEnd``. They were handled as
+  errors, so ``reqTickersAsync`` returned at the notice, before the data,
+  and the snapshot's subscription closed. They are warnings now, as 10167
+  is.
+* **Empty values other than numbers and None broke the quote.** With an
+  enum or string ``emptySize``, ``hasBidAsk``, ``midpoint`` and
+  ``marketPrice`` raised ``TypeError``, as did a ``last`` tick while
+  ``close`` held the ``unset`` value; with NaN, ``marketPrice`` returned
+  the NaN. With the default -1 and 0, an emptied quote side reached
+  bars built from ``updateEvent.bids()`` as a price of -1. A stateful
+  test now drives every tick handler with each kind of empty value.
+* **``util.useQt`` with PySide6** runs Qt's loop with ``exec()``; it used
+  the deprecated ``exec_()``. (:issue:`134`, thanks to @Flippo24)
+* **``IBC(twsVersion=...)`` takes a string**, as macOS needs: ``"10.19"``,
+  with the period, as in the macOS install folder (1019 on Windows and
+  Linux). It was typed and documented as an integer. An empty or zero
+  one raises ``ValueError`` when the ``IBC`` is made, where IBC's start
+  script failed on it, saying so only in its output. (:issue:`57`)
+* **``TickerUpdateEvent.trades()`` left out RT Trade Volume** (tick 77)
+  while it passed RT Volume (tick 48), so tick, volume and time bars built
+  on it missed those trades. (:issue:`45`)
+* **``reqHistoricalNews`` gave up after a fixed 4 seconds**, short for
+  300 headlines; ``timeout`` is now a parameter (default 60, like
+  ``reqHistoricalData``). The docstring notes that IBKR's server does
+  not reliably keep to the date range, as users found with IBKR's own
+  clients too. (:issue:`108`)
+* **``reqHeadTimeStamp`` left failed and abandoned requests open.** IBKR
+  holds a head timestamp request open, against its limit of 50 open
+  historical requests, until it is cancelled; the cancel was only sent
+  for an answered request, so a request that failed or that a timeout or
+  cancellation gave up on kept its slot. It is now cancelled however it
+  ends. A request its awaiter gives up on is also no longer kept in the
+  client's own request table. (:issue:`149`)
+* **A refused request answers its own kind of empty.** With
+  ``RaiseRequestErrors`` off, a refused ``reqHeadTimeStamp``,
+  ``reqNewsArticle``, ``reqUserInfo``, ``calculateImpliedVolatility`` or
+  ``calculateOptionPrice`` answers ``None``, and ``reqHistoricalSchedule``
+  an empty ``HistoricalSchedule``, where each answered an empty list.
+  ``reqSoftDollarTiers`` and ``reqFamilyCodes`` are answered (they never
+  were), and ``requestFA`` for FA profiles on a server that no longer has
+  them raises ``ValueError`` instead of waiting for an answer that never
+  comes.
+* **Requests IBKR keeps open are ended however their caller stops.**
+  ``reqHistoricalData`` and ``reqHistoricalSchedule`` sent
+  ``cancelHistoricalData`` only on their own timeout; a caller's
+  cancellation, or the timeout of a sync call (``RequestTimeout``), left
+  the request open with IBKR and a ``keepUpToDate`` subscription
+  streaming into bars nobody had. ``reqPositionsMulti`` and the option
+  calculations no longer send their cancel after a disconnect, which
+  hid the disconnect behind a "Not connected" error.
+* **Concurrent callers of one request no longer share one future.**
+  Callers of a request asked once for all of them (positions, open
+  orders, a market rule, the startup sync) each get a future of their
+  own: one caller's timeout or cancellation used to cancel the request
+  for every caller.
+* **``AccountValue.decimalValue``** returned ``None`` for every
+  per-currency monetary value on TWS installs with TWS API 10.47's
+  ``$LEDGER-`` prefix setting on — the default for new installs. The
+  prefixed tag now classifies like its bare tag; ``tag`` itself keeps
+  the prefix.
+* **Completed orders reported ``Inactive`` instead of ``Filled`` /
+  ``Cancelled``.** TWS API 10.51 sends descriptive text in
+  ``completedStatus`` (``"Filled Size: 10"``, ``"Cancelled by
+  Trader"``), so every completed fill and cancel fell through to the
+  ``Inactive`` fallback with a warning. The known phrasings now map to
+  their terminal status; the original text stays in the trade log.
+* **Validation that vanished under ``python -O``.** ``Forex`` with a
+  pair that is not 6 letters, ``bracketOrder`` with an action other than
+  BUY / SELL, ``util.timeRange`` with a non-positive step and
+  ``util.formatSI`` with a value beyond the SI prefixes now raise
+  ``ValueError`` (they used ``assert``, so ``-O`` skipped the check).
+  Tick types IBKR adds after this release are skipped with a debug log
+  instead of raising inside the market-data handler. Modifying an order
+  whose last known status is finished is sent to TWS with a warning;
+  it previously raised ``AssertionError`` after the modification had
+  already been sent.
+* **``FlexReport`` fetched any URL scheme.** The configured
+  ``IB_FLEXREPORT_URL`` and the statement URL returned by the server are
+  now required to be http(s) with a host (``file://`` and the like are
+  rejected with ``FlexError``), and a success response missing its
+  reference code or URL raises ``FlexError`` instead of failing on an
+  ``assert``.
+* **``util.run`` reported stale global errors.** A run cancelled for
+  any reason raised the last error ``globalErrorEvent`` had ever emitted,
+  so after one global error every later cancellation was misreported as
+  it. ``run`` now raises only an error emitted during that run, chained
+  to the cancellation, and re-raises a plain cancellation unchanged.
+* **Bar and scan result lists were neither equal nor unequal.**
+  ``BarDataList``, ``RealTimeBarList``, ``ScanDataList`` and ``BarList``
+  compare by identity but inherited list inequality and list's missing
+  hash; they are now consistently identity-based and usable as dict keys.
+* **``IBC`` blocked the event loop on Windows** while ``taskkill`` ran
+  during termination; the call is now awaited.
+* **Shared defaults across calls and instances.** The ``TagValue``
+  option parameters (``chartOptions``, ``mktDataOptions``,
+  ``scannerSubscriptionOptions`` and the rest) defaulted to one shared
+  list per method, and every ``IB()`` shared one ``IBDefaults``
+  instance. They now default to an empty tuple and to a fresh
+  ``IBDefaults`` per instance. The option parameters accept any sequence
+  of ``TagValue``; a tuple was previously encoded on the binary wire as
+  its ``repr`` instead of ``tag=value;`` pairs.
+* **A failed send could leave single-flight requests waiting forever.**
+  The account, position, order, scanner-parameter, news-provider,
+  family-code, FA and current-time requests share one in-flight request
+  between concurrent callers. When sending raised (for example
+  ``reqCurrentTimeInMillisAsync`` on a server below version 213, or a
+  send with no connection), the request stayed open, so every later call
+  attached to a future that could never settle. The request is now
+  withdrawn before the error reaches the caller, and a later call sends
+  again.
+* **Event loop warnings and failures on Python 3.12 - 3.14.**
+  ``util.getLoop`` read the thread's loop through the event loop policy
+  API, which warns on 3.12 / 3.13 and is deprecated on 3.14 (removal in
+  3.16), and ``Watchdog.start`` failed on 3.14 when the thread had no loop
+  set. ``util.getLoop`` now shares eventkit's rule: the running loop, else
+  the loop set for the thread (an application's own loop is always used),
+  else a new loop set for the thread; a closed loop is replaced. It emits
+  no warnings on any supported version. ``Watchdog.start`` schedules
+  through it.
+* **Single-exchange market depth (``isSmartDepth=False``) was
+  corrupted.** IBKR inserts and deletes rows in the middle of the book,
+  shifting the rows below, but the book was keyed by row number, so an
+  insert overwrote a level and a delete left a gap. ``domBids`` /
+  ``domAsks`` came out unsorted, with duplicate levels and a first row
+  that was not the best price. Rows now shift as IBKR intends, and
+  an operation on a row below those held is dropped rather than raised
+  on or applied to the wrong row, so a book that is short of TWS's
+  (after a reset race, say) still matches TWS's top rows exactly.
+* **Modifying an order parked from TWS transmitted it.** ``deactivate``
+  can be toggled outside the API, but ``trade.order`` never picked the
+  change up, so ``placeOrder(trade.order)`` sent the stale
+  ``deactivate=False`` and put the parked order on the market. It now
+  tracks every ``openOrder`` update. ``reqOpenOrders`` documents that
+  TWS API 10.48 includes deactivated orders in its response.
 * **``MaxClientVersion = 178`` cap** made every gate 201+ feature
   unreachable in production.
 * **``errorMsg`` decoder** mis-shifted on server >= 194 (ERROR_TIME
@@ -190,6 +638,8 @@ are fixed in v3.0:
   protobuf branch so it applies on both wire paths.
 * **``tickOptionComputation``** correctly maps the ``-2`` sentinel
   to ``None`` for vega and theta (was a tautology returning ``-2.0``).
+  A volatility, price or greek missing from a protobuf message is
+  ``None`` too. It was ``0.0``, which read as a computed value.
 * **``PnLSingle.position``** no longer truncates fractional positions
   to ``int``.
 * **``HistogramData.size``** is now a ``Decimal`` (was buggy
@@ -219,12 +669,11 @@ are fixed in v3.0:
   and Decimal inputs so a stray ``Decimal('NaN')`` from user code
   lands as ``None``.
 * **Binary path msgId framing** at server >= 201 now uses a 4-byte
-  big-endian raw integer prefix (matching IBKR's reference
-  ``comm.make_msg(..., useRawIntMsgId=True)``). The legacy NUL-text
-  framing was silently dropped by server 201+.
+  big-endian raw integer prefix. The legacy NUL-text framing was
+  silently dropped by server 201+.
 * **Wire-boundary None-coalesce** at the protobuf converter entry
-  mirrors the binary path's ``_FORMAT_HANDLERS[type(None)] =
-  lambda _: ""`` behaviour: callers that stamp ``None`` onto plain-
+  mirrors the binary path, which writes ``None`` as ``""``: callers
+  that stamp ``None`` onto plain-
   scalar dataclass fields (e.g. an order-preview path setting
   ``parentId = None``) now produce wire frames with the field at its
   dataclass default rather than absent, which TWS rejected as
@@ -238,34 +687,26 @@ are fixed in v3.0:
   under ``[tool.ib_async.twsapi]``. ``scripts/generate_protos.py``
   fetches that exact archive from ``interactivebrokers.github.io``,
   verifies the SHA, and caches the result under
-  ``~/.cache/ib_async/twsapi-{version}/``. The same archive ships
-  both the ``.proto`` schemas AND the reference ``client_utils.py``
-  that the parity audit walks against — version-locked together,
-  so generated bindings and audit ground truth can never drift. CI
-  reads the same pin and keys its cache step on it. Contributors no
+  ``~/.cache/ib_async/twsapi-{version}/``; only its ``.proto``
+  schemas are used. CI reads the same pin and keys its cache step
+  on it. Contributors no
   longer need a TWS install locally; ``make protos`` is
   self-contained.
 * **Release engineering.** ``ib_async/_pb/`` (generated protobuf
   bindings) is gitignored. The release build regenerates the
-  modules and bundles them into the sdist / wheel via a
-  ``[tool.poetry.include]`` glob in ``pyproject.toml``. End users
+  modules and bundles them into the sdist / wheel via the
+  ``[tool.hatch.build]`` ``artifacts`` globs in ``pyproject.toml``
+  (``artifacts`` re-admits files hatchling would otherwise skip as
+  VCS-ignored). End users
   of ``pip install ib_async`` get the bindings without needing
   ``protoc`` or ``grpcio-tools``; only the runtime ``protobuf``
   dependency is declared. ``scripts/release.py`` orchestrates the
-  full pipeline (fetch + extract → generate → ruff + mypy → parity
-  audit → owned tests → ``uv build`` → clean-venv smoke install).
+  full pipeline (fetch + extract → generate → ruff + mypy → owned
+  tests → ``uv build`` → clean-venv smoke install).
   Publishing is gated behind ``--publish``.
-* **Makefile** targets: ``make protos`` / ``make audit`` /
-  ``make build`` / ``make release`` / ``make publish`` /
-  ``make test`` / ``make lint`` / ``make format`` / ``make clean``.
-* **Protobuf send-path parity audit script** at
-  ``scripts/audit_proto_parity.py`` AST-walks IBKR's reference
-  ``client_utils.py`` and our ``_proto/*.py``, classifies every
-  per-field gate, and reports any divergence. CI runs it as a
-  regression test; any future converter edit that drifts from
-  IBKR's ``isValidIntValue`` / ``isValidFloatValue`` /
-  ``isValidLongValue`` / ``isValidDecimalValue`` semantics breaks
-  the test immediately.
+* **Makefile** targets: ``make protos`` / ``make build`` /
+  ``make release`` / ``make publish`` / ``make test`` /
+  ``make lint`` / ``make format`` / ``make clean``.
 * Hot-path tick / depth records use ``__slots__``.
 * ``processProtoBuf`` caches resolved bound methods on the dispatch
   path.
@@ -273,8 +714,8 @@ are fixed in v3.0:
   single source of truth for IBKR UNSET-sentinel rejection.
 * Comprehensive owned-test suite covering the protobuf seam,
   Decimal coercion, request / subscription lifecycles, dataclass
-  invariants, cross-version decoder gating, and wire-frame parity
-  against IBKR's reference client. Each behavioural fix listed
+  invariants, cross-version decoder gating, and wire-frame
+  conformance with IBKR's protocol. Each behavioural fix listed
   above is pinned by at least one regression test.
 
 2.0
@@ -341,8 +782,18 @@ no behavioural change to the public API.
   timezone consistently across more wrapper callbacks.
 * **Python 3.11 minimum** (was 3.10). Drops compatibility shims for
   older interpreters.
-* **``uv`` toolchain support** alongside ``poetry``. Both
-  ``uv sync`` and ``poetry install`` work; CI tests under both.
+* **Poetry removed; ``uv`` is the only toolchain** (2026-09-16). The
+  build backend moved from ``poetry-core`` to ``hatchling`` and the
+  ``[tool.poetry]`` table is gone; its ``include`` globs for the
+  generated ``ib_async/_pb/`` bindings are now
+  ``[tool.hatch.build]`` ``artifacts``, which bundle the same files
+  into the sdist and wheel while still building cleanly from a
+  checkout with no generated bindings on disk. ``[project]`` already
+  carried the full PEP 621 metadata, so nothing moved out of
+  ``[tool.poetry]``. The duplicate Poetry CI job is retired: both
+  workflows now use ``astral-sh/setup-uv`` with ``uv sync --frozen``
+  and ``uv run --frozen``, and ``uv.lock`` is tracked so ``--frozen``
+  has a lock to honour. README and Makefile document ``uv`` only.
 
 **Fixed**
 
@@ -536,7 +987,7 @@ This major release includes significant new features, performance improvements, 
 
   * ``timestamp``: Float format timestamp for easier mathematical operations alongside existing ``time`` field
   * ``shortable``: Shortability score (0-3) for instruments
-  * ``volumeRate3Min``, ``volumeRate5Min``, ``volumeRate10Min``: IBKR-provided volume acceleration metrics
+  * ``volumeRate3Min``, ``volumeRate5Min``, ``volumeRate10Min``: the volume traded in the last 3, 5 and 10 minutes (generic tick 595)
   * ``lastTimestamp``: Timestamp of the last trade event
 
 * **OrderStatus Enhancements**: Extended order management capabilities

@@ -45,7 +45,7 @@ and further back in time until there is no more data returned.
     # save to CSV file
     allBars = [b for bars in reversed(barsList) for b in bars]
     df = util.df(allBars)
-    df.to_csv(contract.symbol + '.csv', index=False)
+    df.write_csv(contract.symbol + '.csv')
 
 Scanner data (blocking)
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -100,12 +100,42 @@ Order book
 
 .. code-block:: python
 
-    eurusd = Forex('EURUSD')
+    [eurusd] = ib.qualifyContracts(Forex('EURUSD'))
     ticker = ib.reqMktDepth(eurusd)
     while ib.sleep(5):
         print(
             [d.price for d in ticker.domBids],
             [d.price for d in ticker.domAsks])
+
+Bars from live ticks, and indicators on them
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A ticker's trades (or midpoints) can be aggregated into bars locally, for
+the bars IBKR does not offer: any time interval, a number of ticks, or an
+amount of volume. Each bar is a ``RealTimeBar``, with the bar's
+volume-weighted average price in ``wap``:
+
+.. code-block:: python
+
+    [aapl] = ib.qualifyContracts(Stock('AAPL', 'SMART', 'USD'))
+    ticker = ib.reqMktData(aapl)
+    trades = ticker.updateEvent.trades()
+    minuteBars = trades.timebars(Event.timerange(start=0, step=60))
+    tickBars = trades.tickbars(100)
+    volumeBars = trades.volumebars(10_000)
+
+Each emits its completed bars; its ``bars`` holds every bar (or, with
+``maxBars=``, the last that many completed ones), the last in progress.
+An indicator over the bars is a running fold over the completed bars,
+constant time per bar: a session VWAP folds the bars' price × volume and
+volume with ``reduce``, and eventkit's ``ema`` averages their closes.
+From ``examples/programs/live_bars.py``:
+
+.. literalinclude:: ../examples/programs/live_bars.py
+   :pyobject: SessionVwap
+
+.. literalinclude:: ../examples/programs/live_bars.py
+   :pyobject: annotate
 
 Minimum price increments
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -190,7 +220,7 @@ Dividends
 
 .. code-block:: python
 
-    contract = Stock('INTC', 'SMART', 'USD')
+    [contract] = ib.qualifyContracts(Stock('INTC', 'SMART', 'USD'))
     ticker = ib.reqMktData(contract, '456')
     ib.sleep(2)
     print(ticker.dividends)
@@ -198,16 +228,6 @@ Dividends
 Output::
 
     Dividends(past12Months=1.2, next12Months=1.2, nextDate=datetime.date(2019, 2, 6), nextAmount=0.3)
-
-Fundamental ratios
-^^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
-    contract = Stock('IBM', 'SMART', 'USD')
-    ticker = ib.reqMktData(contract, '258')
-    ib.sleep(2)
-    print(ticker.fundamentalRatios)
 
 
 Short-lived connections
@@ -230,12 +250,12 @@ the data that has not been sent yet.
     ib.disconnect()
 
 
-Integration with PyQt5 or PySide2
+Integration with PyQt5 or PySide6
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. image:: images/qt-tickertable.png
 
-`This example <https://github.com/ib-api-reloaded/ib_async/blob/master/examples/qt_ticker_table.py>`_
+`This example <https://github.com/ib-api-reloaded/ib_async/blob/master/examples/gui/qt_ticker_table.py>`_
 of a ticker table shows how to integrate both
 realtime streaming and synchronous API requests in a single-threaded
 Qt application.
@@ -250,7 +270,7 @@ This example depends on PyQt5:
 
 ``pip3 install -U PyQt5``.
 
-It's also possible to use PySide2 instead; To do so uncomment the PySide2
+It's also possible to use PySide6 instead; To do so uncomment the PySide6
 import and ``util.useQt`` lines in the example and comment out their PyQt5
 counterparts.
 
@@ -258,7 +278,7 @@ Integration with Tkinter
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
 To integrate with the Tkinter event loop, take a look at
-`this example app <https://github.com/ib-api-reloaded/ib_async/blob/master/examples/tk.py>`_.
+`this example app <https://github.com/ib-api-reloaded/ib_async/blob/master/examples/gui/tk.py>`_.
 
 Integration with PyGame
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -288,7 +308,7 @@ run for short whiles and keep up to date:
 
     ib = ibi.IB()
     ib.connect()
-    contract = ibi.Forex('EURUSD')
+    [contract] = ib.qualifyContracts(ibi.Forex('EURUSD'))
     ticker = ib.reqMktData(contract)
     ticker.updateEvent += onTicker
 

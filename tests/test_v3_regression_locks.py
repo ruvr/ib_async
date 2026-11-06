@@ -1,8 +1,7 @@
 """Regression locks for v3.0 IBKR-parity fixes.
 
 Each test pins one specific behaviour that the v3.0 wire-protocol and
-Decimal-coercion sweep caught and fixed against the IBKR reference
-client. The tests are intentionally small, standalone, and worded so a
+Decimal-coercion sweep caught and fixed. The tests are intentionally small, standalone, and worded so a
 future refactor that unfixes the issue surfaces a clearly-named failure
 rather than a silent regression cascade.
 
@@ -14,6 +13,7 @@ and send-side parity fixes.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import math
 import struct
 from collections import OrderedDict
@@ -35,7 +35,7 @@ from ib_async.objects import (
     AccountValue,
     OptionComputation,
 )
-from ib_async.order import Order, OrderState, _toDecimal
+from ib_async.order import Order, OrderState, OrderStateNumeric, finiteDecimal
 from ib_async.wrapper import _MAX_PENDING_COMMISSION_REPORTS
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ def test_account_value_decimal_value_none_for_non_monetary_tag():
 
 
 # ---------------------------------------------------------------------------
-# Order._toDecimal filters NaN / Infinity from float and Decimal inputs
+# Order.finiteDecimal filters NaN / Infinity from float and Decimal inputs
 # ---------------------------------------------------------------------------
 
 
@@ -122,26 +122,26 @@ def test_account_value_decimal_value_none_for_non_monetary_tag():
     ],
 )
 def test_to_decimal_filters_nan_and_infinity(bad):
-    """``_toDecimal`` must coerce NaN / Infinity to None on both the
+    """``finiteDecimal`` must coerce NaN / Infinity to None on both the
     float and Decimal input branches. The trap is ``Decimal('NaN')``
     being silently truthy — ``if order.lmtPrice:`` returns True on NaN
     but False on None.
     """
-    assert _toDecimal(bad) is None
+    assert finiteDecimal(bad) is None
 
 
 def test_to_decimal_real_float_still_passes_via_str():
     """The companion positive path — a real float still goes through
     ``str()`` so binary-float imprecision is bounded.
     """
-    assert _toDecimal(0.1) == Decimal("0.1")
-    assert _toDecimal(50.5) == Decimal("50.5")
+    assert finiteDecimal(0.1) == Decimal("0.1")
+    assert finiteDecimal(50.5) == Decimal("50.5")
 
 
 def test_order_post_init_filters_decimal_nan_input():
     """An ``Order`` constructed with ``Decimal('NaN')`` on a Decimal
     field must NOT keep the NaN — ``__post_init__`` re-runs
-    ``_toDecimal`` even on pre-coerced Decimal inputs so a stray NaN
+    ``finiteDecimal`` even on pre-coerced Decimal inputs so a stray NaN
     from user code lands as ``None``.
     """
     order = Order(orderType="LMT", lmtPrice=Decimal("NaN"))
@@ -160,6 +160,15 @@ def test_order_post_init_filters_float_infinity_input():
     """``float('inf')`` is the third trap variant; same expected outcome."""
     order = Order(orderType="LMT", trailingPercent=float("inf"))
     assert order.trailingPercent is None
+
+
+@pytest.mark.parametrize(
+    "nan", [Decimal("sNaN"), Decimal("-sNaN"), "sNaN", Decimal("NaN"), "nan"]
+)
+def test_a_nan_is_unset_where_infinity_is_kept(nan):
+    """competeAgainstBestOffset keeps +Infinity, but a NaN, signaling ones
+    included (which raise when compared), is unset there as anywhere."""
+    assert Order(competeAgainstBestOffset=nan).competeAgainstBestOffset is None
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +320,15 @@ def test_order_state_numeric_converts_outsidertch_margins():
     assert numeric.maintMarginAfterOutsideRTH == 300.75
 
 
+def test_order_state_numeric_is_an_order_state_numeric():
+    """As annotated, so its repr and the commission alias's warning name
+    it, and isinstance tells it from the string-valued state."""
+    numeric = OrderState(initMarginBefore="1.5", status="Submitted").numeric()
+    assert type(numeric) is OrderStateNumeric
+    assert (numeric.initMarginBefore, numeric.status) == (1.5, "Submitted")
+    assert repr(numeric).startswith("OrderStateNumeric(")
+
+
 # ---------------------------------------------------------------------------
 # tickOptionComputation vega/theta sentinel maps to None
 # ---------------------------------------------------------------------------
@@ -327,7 +345,7 @@ def test_tick_option_computation_vega_theta_sentinel_maps_to_none():
     # Pre-register an in-flight request so the wrapper's
     # "reply from calculateImpliedVolatility / calculateOptionPrice"
     # branch fires and we can inspect the produced OptionComputation.
-    request, _isNew = ib.wrapper.requests.open(ReqIdKey(reqId))
+    request = ib.wrapper.requests.open(ReqIdKey(reqId))
 
     ib.wrapper.tickOptionComputation(
         reqId,
@@ -363,7 +381,7 @@ def test_tick_option_computation_other_sentinels_still_map_to_none():
     """
     ib = ibi.IB()
     reqId = 43
-    request, _isNew = ib.wrapper.requests.open(ReqIdKey(reqId))
+    request = ib.wrapper.requests.open(ReqIdKey(reqId))
 
     ib.wrapper.tickOptionComputation(
         reqId,
@@ -428,28 +446,26 @@ def test_watchdog_probe_contract_defaults_to_eurusd_forex():
 
 
 # ---------------------------------------------------------------------------
-# Wrapper.headTimestamp catches ZoneInfoNotFoundError
+# Wrapper.headTimestamp surfaces an unknown time zone as the request error
 # ---------------------------------------------------------------------------
 
 
 def test_head_timestamp_zone_info_not_found_surfaces_as_request_error():
-    """``parseIBDatetime`` raises ``ZoneInfoNotFoundError`` (a subclass
-    of ``KeyError``, NOT of ``ValueError``) when IBKR ships a timezone
-    the host doesn't know. Catching only ``ValueError`` would leave
-    the awaiter on ``reqHeadTimeStampAsync`` hanging forever instead
-    of seeing the error.
+    """A timezone the host doesn't know makes ``parseIBDatetime`` raise a
+    ``ValueError`` naming it, like any other unreadable part of an IB
+    datetime, and the awaiter on ``reqHeadTimeStampAsync`` sees that error
+    instead of hanging forever.
     """
     ib = ibi.IB()
     reqId = 77
-    request, _isNew = ib.wrapper.requests.open(ReqIdKey(reqId))
+    request = ib.wrapper.requests.open(ReqIdKey(reqId))
 
     # An unknown-timezone wire string — IBKR's ``YYYYmmdd HH:MM:SS Tz``
-    # shape with a TZ name not in the host's tzdata. ``ZoneInfo`` raises
-    # ``ZoneInfoNotFoundError``.
+    # shape with a TZ name not in the host's tzdata.
     ib.wrapper.headTimestamp(reqId, "20221125 10:00:00 Mars/Olympus")
 
     assert request.future.done()
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError, match="unknown time zone 'Mars/Olympus'"):
         request.future.result()
 
 
@@ -460,12 +476,12 @@ def test_head_timestamp_value_error_still_surfaces_as_request_error():
     """
     ib = ibi.IB()
     reqId = 78
-    request, _isNew = ib.wrapper.requests.open(ReqIdKey(reqId))
+    request = ib.wrapper.requests.open(ReqIdKey(reqId))
 
     ib.wrapper.headTimestamp(reqId, "not-a-date")
 
     assert request.future.done()
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         request.future.result()
 
 
@@ -475,7 +491,7 @@ def test_head_timestamp_success_path_resolves_with_datetime():
     """
     ib = ibi.IB()
     reqId = 79
-    request, _isNew = ib.wrapper.requests.open(ReqIdKey(reqId))
+    request = ib.wrapper.requests.open(ReqIdKey(reqId))
 
     ib.wrapper.headTimestamp(reqId, "20221125 10:00:00 US/Eastern")
 
@@ -488,26 +504,43 @@ def test_head_timestamp_success_path_resolves_with_datetime():
 
 
 # ---------------------------------------------------------------------------
-# Cross-check — math.nan handling on _toDecimal vs Decimal('NaN')
+# Cross-check — math.nan handling on finiteDecimal vs Decimal('NaN')
 # ---------------------------------------------------------------------------
 
 
 def test_to_decimal_math_nan_vs_decimal_nan_equivalent():
     """Both ``math.nan`` and ``Decimal('NaN')`` are NaN-shaped; both
     must coerce to None. Locks the symmetry between the two input
-    branches of ``_toDecimal``.
+    branches of ``finiteDecimal``.
     """
-    assert _toDecimal(math.nan) is None
-    assert _toDecimal(Decimal("NaN")) is None
+    assert finiteDecimal(math.nan) is None
+    assert finiteDecimal(Decimal("NaN")) is None
     # They are NOT equal — Decimal('NaN') != float('nan') in Python —
-    # but ``_toDecimal``'s contract is the same: both unset.
+    # but ``finiteDecimal``'s contract is the same: both unset.
 
 
 # ---------------------------------------------------------------------------
 # Send-side test scaffolding lives in ``tests._helpers``.
 # ---------------------------------------------------------------------------
 
-from tests._helpers import _captureSend, _ibAtVersion
+import pathlib
+import warnings
+
+import ib_async.ibcontroller as ibc_mod
+from ib_async._pb import (
+    CommissionAndFeesReport_pb2,
+    Contract_pb2,
+    Execution_pb2,
+    ExecutionDetails_pb2,
+    OpenOrder_pb2,
+    OrderStatus_pb2,
+    TickPrice_pb2,
+    TickSize_pb2,
+)
+from ib_async._proto.orders import createOrder, createOrderProto
+from ib_async._subscriptions import MktDataSub
+from ib_async.ibcontroller import IBC
+from tests._helpers import _captureSend, _ibAtVersion, inject_trade
 
 # ---------------------------------------------------------------------------
 # Client.replaceFA reqId trailing field gated at server 157
@@ -560,15 +593,15 @@ def test_replace_fa_appends_reqid_at_gate_157():
 
 def test_request_fa_rejects_profile_faData_at_gate_177():
     """faData=2 (Profiles) was de-supported at server gate 177
-    (FA_PROFILE_DESUPPORT). ``requestFA`` must reject the request
-    locally without putting anything on the wire — mirrors IBKR's
-    reference client behaviour and avoids a server bounce.
+    (FA_PROFILE_DESUPPORT). ``requestFA`` must refuse the request
+    without putting anything on the wire, which no server would answer.
     """
     assert MIN_SERVER_VER_FA_PROFILE_DESUPPORT == 177
     ib = _ibAtVersion(MIN_SERVER_VER_FA_PROFILE_DESUPPORT)
     sent = _captureSend(ib)
 
-    ib.client.requestFA(faData=2)
+    with pytest.raises(ValueError, match="FA profiles"):
+        ib.client.requestFA(faData=2)
     assert sent == []
 
 
@@ -674,7 +707,6 @@ def test_decoder_uses_named_constant_for_duration_gate():
     constant, not a literal. A future refactor that hardcodes ``158``
     or ``159`` would lose the off-by-one safety the constant provides.
     """
-    import pathlib
 
     decoder_src = pathlib.Path("ib_async/decoder.py").read_text()
     # The constant import + usage at the openOrder gate.
@@ -695,8 +727,7 @@ def test_decoder_uses_named_constant_for_duration_gate():
 def test_send_uses_raw_int_msg_id_at_protobuf_gate():
     """At server >= MIN_SERVER_VER_PROTOBUF (201), the binary ``Client.send``
     emits a 4-byte big-endian raw msgId prefix followed by NUL-terminated
-    body bytes. Mirrors IBKR's ``comm.make_msg(msgId, useRawIntMsgId=True,
-    text)``. Sending the legacy NUL-text msgId to a 201+ server makes the
+    body bytes. Sending the legacy NUL-text msgId to a 201+ server makes the
     server fail to decode and silently drop the connection.
     """
     assert MIN_SERVER_VER_PROTOBUF == 201
@@ -846,7 +877,7 @@ def test_cancel_async_method_settles_in_flight_future(cancel_name: str):
 
     # Pre-open the in-flight registry entry the cancel must settle.
     reqId = 12345
-    request, _isNew = ib.wrapper.requests.open(ReqIdKey(reqId))
+    request = ib.wrapper.requests.open(ReqIdKey(reqId))
 
     # Stub the wire-side cancel so we don't need a real connection.
     setattr(ib.client, cancel_name, lambda _reqId: None)
@@ -910,7 +941,7 @@ async def test_req_tickers_async_closes_subs_on_gather_raise():
         ReqIdKey(reqIds[0]), ConnectionError("simulated wire failure")
     )
 
-    with pytest.raises(BaseException):
+    with pytest.raises(ConnectionError):
         await fut
 
     # The finally clause must have closed every snapshot sub, even
@@ -931,7 +962,6 @@ async def test_ibc_monitor_async_breaks_on_stdout_read_exception():
     propagate out and silently kill the monitor task — the IBC process
     owner would never know.
     """
-    from ib_async.ibcontroller import IBC
 
     ibc = IBC(twsVersion=974, gateway=True)
 
@@ -963,12 +993,12 @@ async def test_ibc_monitor_async_drains_garbled_bytes_with_replace_decode():
     garbled bytes flow through as replacement characters instead of
     crashing the loop on a UnicodeDecodeError.
     """
-    from ib_async.ibcontroller import IBC
 
     ibc = IBC(twsVersion=974, gateway=True)
 
     class _GarbledStdout:
-        _lines = [b"\xff\xfe garbled \x80\x81 bytes\n", b""]  # second is EOF
+        def __init__(self):
+            self._lines = [b"\xff\xfe garbled \x80\x81 bytes\n", b""]  # then EOF
 
         async def readline(self):
             if self._lines:
@@ -1005,7 +1035,6 @@ async def test_ibc_terminate_async_escalates_to_sigkill_on_timeout():
     would let a hung TWS during the daily reset block the Watchdog
     reconnect loop forever.
     """
-    from ib_async.ibcontroller import IBC
 
     ibc = IBC(twsVersion=974, gateway=True)
 
@@ -1034,7 +1063,6 @@ async def test_ibc_terminate_async_escalates_to_sigkill_on_timeout():
 
     # Replace asyncio.wait_for inside the ibcontroller module so the
     # bounded waits "fire" their timeout immediately.
-    import ib_async.ibcontroller as ibc_mod
 
     real_wait_for = asyncio.wait_for
 
@@ -1069,7 +1097,6 @@ async def test_ibc_terminate_async_no_op_when_no_proc():
     must not raise or accidentally invoke terminate/kill on the
     sentinel.
     """
-    from ib_async.ibcontroller import IBC
 
     ibc = IBC(twsVersion=974, gateway=True)
     assert ibc._proc is None
@@ -1086,7 +1113,6 @@ def test_commission_report_canonical_name_is_commission_and_fees():
     in v3.0. The legacy ``commission`` attribute still works but emits
     ``DeprecationWarning``; the canonical access does not.
     """
-    import warnings
 
     report = ibi.CommissionReport(commissionAndFees=Decimal("1.25"))
     # Canonical access — no warning.
@@ -1115,29 +1141,30 @@ def test_commission_report_legacy_write_emits_deprecation_warning():
     assert report.commissionAndFees == Decimal("2.50")
 
 
-def test_commission_report_legacy_construction_emits_deprecation_warning():
-    """``CommissionReport(commission=...)`` keyword arg keeps working
-    for v2.x callers but emits ``DeprecationWarning`` and aliases to
-    ``commissionAndFees``.
-    """
-    with pytest.warns(DeprecationWarning, match="commissionAndFees"):
-        report = ibi.CommissionReport(execId="x", commission=Decimal("3.75"))
-    assert report.commissionAndFees == Decimal("3.75")
-    assert report.execId == "x"
+@pytest.mark.parametrize("cls", [ibi.CommissionReport, OrderState])
+def test_commission_is_no_constructor_keyword(cls):
+    """The constructor takes ``commissionAndFees`` alone: ``commission``
+    is not a field, so ``fields()`` and ``dataclasses.replace`` never see
+    it (or its warning)."""
+    with pytest.raises(TypeError, match="commission"):
+        cls(commission=Decimal("3.75"))
+    assert "commission" not in {f.name for f in dataclasses.fields(cls)}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        changed = dataclasses.replace(cls(), commissionAndFees=Decimal(1))
+        OrderState(commissionAndFees=Decimal(2)).numeric()
+    assert changed.commissionAndFees == Decimal(1)
 
 
-def test_order_state_commission_alias_round_trips():
-    """``OrderState`` has the same deprecation alias; verify
-    construction, read, and write all flow through to ``commissionAndFees``.
-    """
-    from ib_async.order import OrderState
-
-    with pytest.warns(DeprecationWarning):
-        state = OrderState(commission=Decimal("5.00"))
-    assert state.commissionAndFees == Decimal("5.00")
-    with pytest.warns(DeprecationWarning):
+@pytest.mark.parametrize("cls", [OrderState, OrderStateNumeric])
+def test_order_state_commission_alias_round_trips(cls):
+    """``OrderState`` (and its numeric helper type) has the same
+    deprecation alias, naming its own class; read and write flow through
+    to ``commissionAndFees``."""
+    state = cls(commissionAndFees=Decimal("5.00"))
+    with pytest.warns(DeprecationWarning, match=f"^{cls.__name__}.commission"):
         assert state.commission == Decimal("5.00")
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(DeprecationWarning, match=f"^{cls.__name__}.commission"):
         state.commission = Decimal("6.00")
     assert state.commissionAndFees == Decimal("6.00")
 
@@ -1154,7 +1181,6 @@ def _seed_trade_for_order_status(
     and lands the decoded fields on ``trade.orderStatus`` instead of
     logging "No order found".
     """
-    from tests._helpers import inject_trade
 
     return inject_trade(
         ib,
@@ -1279,7 +1305,6 @@ def test_server_order_decimal_fields_round_trip_via_proto_open_order():
     the proto path is the canonical receive path on modern servers
     (gate 203+) and is exercised here.
     """
-    from ib_async._pb import OpenOrder_pb2
 
     ib = ibi.IB()
     ib.wrapper.clientId = 0
@@ -1331,7 +1356,6 @@ def test_create_order_proto_exhaustive_parity_round_trip():
     assert each set field round-trips (modulo Decimal precision and
     the well-known wire-domain rename pairs).
     """
-    from ib_async._proto.orders import createOrder, createOrderProto
 
     original = Order(
         orderId=42,
@@ -1371,8 +1395,14 @@ def test_create_order_proto_exhaustive_parity_round_trip():
     serialized = proto.SerializeToString()
     assert len(serialized) > 0, "Serialized proto must carry at least one set field"
 
+    # ``orderId`` rides the REQUEST ENVELOPE (``PlaceOrderRequest``),
+    # never ``Order`` itself, so ``createOrderProto`` does not write
+    # it. The decoder receives it the
+    # way ``createOpenOrder`` passes it: as an explicit argument.
+    assert not proto.HasField("orderId")
+
     # Round-trip back to a domain Order.
-    decoded = createOrder(proto)
+    decoded = createOrder(proto, orderId=original.orderId)
 
     # Every set field must come back with the same value.
     assert decoded.orderId == original.orderId
@@ -1430,8 +1460,6 @@ def test_binary_and_proto_order_status_produce_identical_trade_state():
     byte-equivalent ``Decimal`` values on ``Trade.orderStatus`` —
     same precision, same sentinel→None mapping.
     """
-    from ib_async._pb import OrderStatus_pb2
-    from tests._helpers import inject_trade
 
     # Binary path
     ib_bin = ibi.IB()
@@ -1492,7 +1520,6 @@ def test_binary_and_proto_exec_details_produce_identical_execution_state():
     a byte-equivalent ``Execution`` with the same Decimal-typed
     ``shares`` / ``price`` / ``cumQty`` / ``avgPrice`` / ``evMultiplier``.
     """
-    from ib_async._pb import Contract_pb2, Execution_pb2, ExecutionDetails_pb2
 
     # Binary path (mirroring _binary_exec_details_fields pattern)
     ib_bin = ibi.IB()
@@ -1590,7 +1617,6 @@ def test_binary_and_proto_commission_report_produce_identical_state():
     must land byte-equivalent Decimal-typed ``commissionAndFees`` /
     ``realizedPNL`` / ``yield_`` on the report.
     """
-    from ib_async._pb import CommissionAndFeesReport_pb2
 
     # Binary path
     ib_bin = ibi.IB()
@@ -1638,8 +1664,6 @@ def test_binary_and_proto_tick_price_produce_identical_ticker_state():
     """msgId 1 (TickPrice). Binary and protobuf paths must update the
     matching ``Ticker`` with the same price + size.
     """
-    from ib_async._pb import TickPrice_pb2
-    from ib_async._subscriptions import MktDataSub
 
     def _seedTicker(ib, reqId):
         contract = ibi.Stock("AAPL", "SMART", "USD")
@@ -1676,8 +1700,6 @@ def test_binary_and_proto_tick_size_produce_identical_ticker_state():
     """msgId 2 (TickSize). Binary and protobuf paths must update the
     matching ``Ticker`` with the same volume / size value.
     """
-    from ib_async._pb import TickSize_pb2
-    from ib_async._subscriptions import MktDataSub
 
     def _seedTicker(ib, reqId):
         contract = ibi.Stock("AAPL", "SMART", "USD")

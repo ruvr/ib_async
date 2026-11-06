@@ -5,16 +5,21 @@ on first run (version + SHA256 pinned in ``pyproject.toml``
 ``[tool.ib_async.twsapi]``) and cached under
 ``~/.cache/ib_async/twsapi-{version}/``. Subsequent runs reuse the
 cache. The same script powers local dev, CI, and the release
-pipeline so all three fetch identical bytes — no drift between what
-gets shipped and what the parity audit checks against.
+pipeline so all three fetch identical bytes. Only the ``.proto``
+schemas and the version marker are extracted.
 
 Override the cached source by setting ``IB_PROTO_SOURCE`` to a
 directory of ``.proto`` files — useful when iterating against a
 local TWS install's bundled schemas.
 
+IBKR prunes old archive versions without notice. When the pinned one
+disappears, the fetch says so and names the way out: re-pin with
+``make twsapi-bump``, or point ``IB_TWSAPI_ARCHIVE`` at a mirrored
+copy of the pinned archive (still SHA256-verified against the pin).
+
 Generated bindings live under ``ib_async/_pb/`` (gitignored, bundled
-into the wheel via ``[tool.poetry.include]``). End users do not need
-``protoc`` or ``grpcio-tools``.
+into the wheel via ``[tool.hatch.build] artifacts``). End users do not
+need ``protoc`` or ``grpcio-tools``.
 
 Behaviour:
   1. Resolve the proto source dir (env override / cache / fetch).
@@ -28,22 +33,19 @@ Behaviour:
 
 from __future__ import annotations
 
-import hashlib
-import io
 import os
 import re
 import shutil
 import sys
-import urllib.request
-import zipfile
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from _twsapi_meta import REPO_ROOT, TwsapiMeta  # noqa: E402
-from _twsapi_meta import load as load_meta  # noqa: E402
+import _twsapi_archive as archive
+from _twsapi_meta import REPO_ROOT, TwsapiMeta
+from _twsapi_meta import load as load_meta
 
 OUTPUT_DIR = REPO_ROOT / "ib_async" / "_pb"
 
@@ -83,30 +85,31 @@ def _cache_is_valid(meta: TwsapiMeta) -> bool:
         return False
     if not meta.version_file.is_file():
         return False
-    # client_utils.py is the audit script's parity ground truth. A
-    # cache missing it would pass the proto-only check yet break
-    # ``make audit`` later — re-fetch instead.
-    if not meta.client_utils_path.is_file():
-        return False
     raw = meta.version_file.read_text().strip()
     return raw == f"API_Version={meta.dotted_version}"
 
 
-_FETCH_TIMEOUT_SECONDS = 120
-
-
 def _fetch_and_extract(meta: TwsapiMeta) -> None:
-    meta.cache_dir.parent.mkdir(parents=True, exist_ok=True)
-    print(f"downloading {meta.archive_url}")
-    with urllib.request.urlopen(
-        meta.archive_url, timeout=_FETCH_TIMEOUT_SECONDS
-    ) as resp:
-        data = resp.read()
+    # ``IB_TWSAPI_ARCHIVE`` points at a mirror or local copy of the
+    # pinned archive for when IBKR has pruned it. The SHA256 pin still
+    # applies, so an override can't swap in different bytes.
+    source = os.environ.get(archive.ARCHIVE_ENV) or meta.archive_url
+    print(f"fetching {source}")
+    try:
+        data = archive.read(source)
+    except archive.ArchiveUnavailable as exc:
+        sys.exit(
+            f"cannot fetch TWS API {meta.version}: {exc}\n"
+            f"  `make twsapi-status` shows which versions IBKR still serves;\n"
+            f"  `make twsapi-bump V=<version>` re-pins to one of them.\n"
+            f"  To stay on {meta.version}, set {archive.ARCHIVE_ENV} to a\n"
+            f"  path or URL holding a copy of the pinned archive."
+        )
 
-    actual = hashlib.sha256(data).hexdigest()
+    actual = archive.sha256(data)
     if actual != meta.archive_sha256:
         sys.exit(
-            f"SHA256 mismatch for {meta.archive_url}\n"
+            f"SHA256 mismatch for {source}\n"
             f"  expected: {meta.archive_sha256}\n"
             f"  actual:   {actual}\n"
             f"If IBKR republished the same version (rare), update\n"
@@ -115,21 +118,7 @@ def _fetch_and_extract(meta: TwsapiMeta) -> None:
         )
 
     print(f"verified SHA256, extracting into {meta.cache_dir}")
-    if meta.cache_dir.exists():
-        shutil.rmtree(meta.cache_dir)
-    meta.cache_dir.mkdir(parents=True)
-
-    # Extract only what we use: protos + version marker + the
-    # reference client_utils.py the parity audit walks against.
-    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
-        keep = [
-            m
-            for m in zf.namelist()
-            if m.startswith("IBJts/source/proto/")
-            or m == "IBJts/source/pythonclient/ibapi/client_utils.py"
-            or m == "IBJts/API_VersionNum.txt"
-        ]
-        zf.extractall(meta.cache_dir, keep)
+    archive.extract(data, meta.cache_dir)
 
 
 def _reset_output() -> None:
@@ -139,7 +128,9 @@ def _reset_output() -> None:
 
 
 def _run_protoc(source_dir: Path) -> None:
-    from grpc_tools import protoc
+    # grpc_tools is a build-time dependency; the other commands of this
+    # script run without it.
+    from grpc_tools import protoc  # noqa: PLC0415
 
     proto_files = sorted(str(p) for p in source_dir.glob("*.proto"))
     args = [

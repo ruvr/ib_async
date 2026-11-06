@@ -1,4 +1,3 @@
-# Adapted from https://tomasfarias.dev/articles/sphinx-docs-with-poetry-and-github-pages/
 name: docs
 on:
   push:
@@ -20,35 +19,40 @@ jobs:
       name: github-pages
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: 3.12
 
-      - name: Install Poetry
-        run: |
-          pip install pip poetry setuptools wheel -U
+      - name: Install uv toolchain
+        uses: astral-sh/setup-uv@v10.3.2
 
       - name: Install dependencies
         run: |
-          poetry install --with=docs
+          uv sync --frozen --group docs
+
+      # The API pages import ib_async, which needs the generated bindings.
+      - name: Generate protobuf bindings
+        run: make protos
+        env:
+          UV_FROZEN: "1"
 
       - name: Build documentation
         run: |
           mkdir html
           touch html/.nojekyll
-          poetry run sphinx-build -b html docs html
+          uv run --frozen sphinx-build -b html docs html
 
       - name: Upload documentation artifact
         if: ${{ github.event_name == 'push' }}
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: html
 
       - name: Deploy documentation
         if: ${{ github.event_name == 'push' }}
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

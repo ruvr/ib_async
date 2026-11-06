@@ -7,17 +7,15 @@ unset values land as ``None`` so user code's ``if order.lmtPrice:``
 keeps working.
 
 The send-side ``create*Proto`` helpers always read from the source
-domain object — never from the freshly-empty target proto. That
-discipline guards against the contributor's upstream PR bug where
-``createOrderProto`` had ``if isValidIntValue(order.clientId):
-order.clientId = order.clientId`` (note ``=`` self-assignment) and
-silently dropped ``clientId`` from every outbound order. The
-``test_orders_proto_round_trips_clientId`` regression test exercises
-that exact path.
+domain object and write to the target proto — never read the
+freshly-empty target, whose every field is unset, nor assign a field to
+itself: either silently drops the field (``clientId`` from every
+outbound order, say).
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, MutableMapping
 from decimal import Decimal
 
 from .._pb import (
@@ -59,6 +57,7 @@ from ..order import (
     PriceCondition,
     TimeCondition,
     VolumeCondition,
+    decimalOrInfinity,
 )
 from ..util import UNSET_INTEGER
 from .contracts import createContract, createContractProto
@@ -95,66 +94,53 @@ def _decimalToWireString(value: Decimal | None) -> str:
 # --- Order ---------------------------------------------------------------
 
 
-def _fillTagValueMap(items: list[TagValue] | None, target: object) -> None:
+def _fillTagValueMap(
+    items: list[TagValue] | None, target: MutableMapping[str, str]
+) -> None:
     """Copy a domain ``list[TagValue]`` into a proto ``map<string,string>``.
 
-    Mirrors IBKR's ``fillTagValueList`` helper. Empty / ``None`` lists
-    leave the target untouched so the field stays unset on the wire.
-    The target arg is a ``ScalarMap[str, str]`` from the parent proto;
-    typed as ``object`` here because the protobuf generated stubs don't
-    expose a public name we can import.
+    An empty or ``None`` list leaves the target untouched, so the field
+    stays unset on the wire. The target is the map field of the parent
+    proto, which is a mutable mapping of strings.
     """
     if not items:
         return
     for tv in items:
-        target[tv.tag] = tv.value  # type: ignore[index]
+        target[tv.tag] = tv.value
 
 
-def _parseTagValueList(source: object) -> list[TagValue]:
+def _parseTagValueList(source: Mapping[str, str]) -> list[TagValue]:
     """Decode a proto ``map<string,string>`` into a domain
-    ``list[TagValue]``. Mirrors IBKR's ``decodeTagValueList``.
-
-    The source arg is a ``ScalarMap[str, str]`` from the parent proto;
-    typed as ``object`` here because the protobuf generated stubs don't
-    expose a public name we can import.
-    """
-    if not source:
-        return []
-    out: list[TagValue] = []
-    for tag, value in source.items():  # type: ignore[attr-defined]
-        out.append(TagValue(tag=tag, value=value))
-    return out
+    ``list[TagValue]``. The source is the map field of the parent proto."""
+    return [TagValue(tag=tag, value=value) for tag, value in source.items()]
 
 
 def createOrderProto(order: Order) -> Order_pb2.Order:
     """Encode a domain ``Order`` into its protobuf representation.
 
-    Mirrors IBKR's ``client_utils.createOrderProto`` field-by-field so
-    the wire payload carries every order parameter the server expects.
-    The previous implementation only wrote ~30 of ~140 fields — most
-    catastrophically dropping ``transmit`` (domain default ``True``),
-    which made every outbound protobuf-path order land as a
-    non-transmitted staged order on the broker.
+    Writes every order parameter the server expects, field by field;
+    one left out is one the server reads as unset, and for ``transmit``
+    (domain default ``True``) that stages the order instead of
+    transmitting it.
 
-    Every IBKR-reference field maps to an ``Order_pb2`` field at this
-    proto version. Compliance / origination fields
-    (``customerAccount``, ``professionalCustomer``,
-    ``bondAccruedInterest``, ``includeOvernight``, ``submitter``) are
-    written on send so a user's re-place of a fetched order preserves
-    the originating session — silent data loss before, regulatory-
-    relevant. Specialized order-behavior flags (``allowPreOpen``,
+    Every Order field ``Order_pb2`` has is written; IBKR's ``Order_pb2``
+    has no ``auctionStrategy``, so an auction order's strategy is not sent
+    on this path. Compliance / origination fields (``customerAccount``,
+    ``professionalCustomer``, ``bondAccruedInterest``, ``includeOvernight``,
+    ``submitter``) are written on send, so an order fetched and placed
+    again keeps them. Specialized order-behavior flags (``allowPreOpen``,
     ``deactivate``, ``postOnly``, ``ignoreOpenAuction``,
-    ``seekPriceImprovement``, ``whatIfType``, ``hedgeMaxSize``) round
-    out the IBKR parity surface.
+    ``seekPriceImprovement``, ``whatIfType``, ``hedgeMaxSize``) are written
+    too.
     """
     # Wire-boundary parity with the binary path: ``Client.send`` maps
     # ``None`` on a plain-int Order field to ``""``, which the server
     # parses as the wire-default (``0`` for ``parentId`` / ``ocaType``
     # / ``triggerMethod`` / …). The protobuf path can't emit ``""`` for
     # an ``optional int32`` slot, so we coerce ``None → field default``
-    # here before the per-field gates run. Without this, callers that
-    # explicitly set ``order.parentId = None`` (icli's whatIf-preview
-    # path) produce a wire frame missing the field; TWS reads
+    # here before the per-field gates run. Without this, a caller that
+    # sets ``order.parentId = None`` (to send no parent link) produces
+    # a wire frame missing the field; TWS reads
     # proto3-absent as its own ``UNSET_INTEGER = 2147483647`` sentinel
     # and rejects with ``Error 135: Can't find order with id =
     # 2147483647``.
@@ -163,14 +149,23 @@ def createOrderProto(order: Order) -> Order_pb2.Order:
     proto = Order_pb2.Order()
 
     # Order ids — set even at zero where IBKR treats zero as a valid
-    # identifier. ``clientId`` MUST round-trip; the contributor's PR
-    # had a typo here that silently dropped it from every outbound
-    # order, sending fills to the wrong client bucket. IBKR's reference
-    # uses ``isValidIntValue`` (≠ UNSET sentinel) so ``0`` flows through.
+    # identifier. ``clientId`` MUST round-trip: an order without it
+    # sends its fills to the wrong client. Only the UNSET sentinel is
+    # skipped, so ``0`` flows through.
+    #
+    # ``orderId`` is deliberately NOT written here. On a REQUEST the
+    # order's identity is carried by the ENVELOPE
+    # (``PlaceOrderRequest.orderId`` / ``CancelOrderRequest.orderId``),
+    # which is why ``Order.orderId`` is never written on send — that
+    # field exists on ``Order.proto`` for the server's ``OpenOrder``
+    # replies. Writing it on send let a stale id
+    # on a reused Order contradict the envelope, which is the
+    # ``Error 135: Can't find order with id = …`` family, and it broke
+    # ``Client.placeOrder``'s documented contract that a caller may
+    # place under a freshly-allocated id "without having to mutate the
+    # source Order".
     if _isValidInt(order.clientId):
         proto.clientId = order.clientId
-    if order.orderId:
-        proto.orderId = order.orderId
     if _isValidLong(order.permId):
         proto.permId = order.permId
     if _isValidInt(order.parentId):
@@ -304,11 +299,13 @@ def createOrderProto(order: Order) -> Order_pb2.Order:
     if order.scaleTable:
         proto.scaleTable = order.scaleTable
 
-    # Hedge
+    # Hedge: hedgeParam is only meaningful with a hedgeType. Send it only
+    # when hedgeType is set, as the binary path does; decoding reads it
+    # back only in that case too.
     if order.hedgeType:
         proto.hedgeType = order.hedgeType
-    if order.hedgeParam:
-        proto.hedgeParam = order.hedgeParam
+        if order.hedgeParam:
+            proto.hedgeParam = order.hedgeParam
 
     # Algo
     if order.algoStrategy:
@@ -322,10 +319,10 @@ def createOrderProto(order: Order) -> Order_pb2.Order:
 
     # CRITICAL: ``transmit`` defaults to True in the domain. If we don't
     # write it through, the server treats absent==False and stages every
-    # order without transmitting. The bool-truthy guard mirrors IBKR's
-    # reference and lets users override to False (proto3 default-False
-    # then leaves the field unset, which the server reads as not
-    # transmitted — the desired behavior for staged-order workflows).
+    # order without transmitting. The bool-truthy guard lets users
+    # override to False (proto3 default-False then leaves the field
+    # unset, which the server reads as not transmitted — the desired
+    # behavior for staged-order workflows).
     if order.whatIf:
         proto.whatIf = order.whatIf
     if order.transmit:
@@ -343,9 +340,8 @@ def createOrderProto(order: Order) -> Order_pb2.Order:
     if order.designatedLocation:
         proto.designatedLocation = order.designatedLocation
     # ``exemptCode`` defaults to ``-1`` in our domain (a real wire value
-    # meaning "not exempt"). IBKR's reference uses ``isValidIntValue``;
-    # since ``-1`` is not the UNSET_INTEGER sentinel the field is
-    # always written, which matches IBKR's behavior.
+    # meaning "not exempt"). Since ``-1`` is not the UNSET_INTEGER
+    # sentinel, the field is always written, as the server expects.
     if _isValidInt(order.exemptCode):
         proto.exemptCode = order.exemptCode
 
@@ -424,6 +420,8 @@ def createOrderProto(order: Order) -> Order_pb2.Order:
         proto.conditionsCancelOrder = order.conditionsCancelOrder
     if order.conditionsIgnoreRth:
         proto.conditionsIgnoreRth = order.conditionsIgnoreRth
+    if order.conditionsIncludeOvernight:
+        proto.conditionsIncludeOvernight = order.conditionsIncludeOvernight
 
     if order.modelCode:
         proto.modelCode = order.modelCode
@@ -466,9 +464,8 @@ def createOrderProto(order: Order) -> Order_pb2.Order:
         proto.discretionaryUpToLimitPrice = order.discretionaryUpToLimitPrice
 
     # ``usePriceMgmtAlgo`` is wire-int (0/1/UNSET) but our domain types
-    # it as ``bool``. Mirror IBKR's convention: write 1/0 when the bool
-    # is set to a truthy/falsy value. Domain default ``False`` would
-    # otherwise leave the field absent and mean "use server default".
+    # it as ``bool``: True is written as 1; the domain default ``False``
+    # leaves the field absent, which means "use the server default".
     if order.usePriceMgmtAlgo:
         proto.usePriceMgmtAlgo = 1
 
@@ -497,29 +494,25 @@ def createOrderProto(order: Order) -> Order_pb2.Order:
     if _isValidFloat(order.midOffsetAtHalf):
         proto.midOffsetAtHalf = float(order.midOffsetAtHalf)
 
-    # Auto-cancel + parent-perm wiring
-    if order.autoCancelDate:
-        proto.autoCancelDate = order.autoCancelDate
+    # Auto-cancel wiring. ``autoCancelParent`` is a request flag the
+    # client sends; ``autoCancelDate`` / ``parentPermId`` are NOT —
+    # the server reports them back on ``OpenOrder`` and owns their
+    # values. Same story for ``shareholder``, ``refFuturesConId`` and
+    # ``filledQuantity``: all five are decode-only fields on
+    # ``Order.proto``, and echoing a server-owned value back on a place
+    # or modify request states something about the order that only the
+    # server may state (``filledQuantity`` on a modify is the sharpest
+    # example). None of them is written on either wire path.
     if order.autoCancelParent:
         proto.autoCancelParent = order.autoCancelParent
-    if order.parentPermId:
-        proto.parentPermId = order.parentPermId
 
     # Misc bool / id extras
-    if order.shareholder:
-        proto.shareholder = order.shareholder
     if order.imbalanceOnly:
         proto.imbalanceOnly = order.imbalanceOnly
     # ``routeMarketableToBbo`` is wire-int (0/1) but domain-bool. Same
     # 1/0 mapping as ``usePriceMgmtAlgo``.
     if order.routeMarketableToBbo:
         proto.routeMarketableToBbo = 1
-    if order.refFuturesConId:
-        proto.refFuturesConId = order.refFuturesConId
-    # ``filledQuantity`` is wire-string (Decimal). Encode same as
-    # ``totalQuantity``.
-    if order.filledQuantity is not None:
-        proto.filledQuantity = _decimalToWireString(order.filledQuantity)
 
     # Compliance / origination fields. These exist on our Order
     # dataclass and are populated on receive, but were silently
@@ -567,8 +560,7 @@ def _createConditionProtos(
 
     The wire proto carries every possible condition field on a single
     flat message and uses ``type`` + ``isMore`` etc. to pick which
-    fields are meaningful — mirrors how IBKR's reference
-    ``createConditionsProto`` writes them. Subclass-specific fields
+    fields are meaningful. Subclass-specific fields
     that aren't on a given condition are simply not set.
     """
     if not conditions:
@@ -611,8 +603,7 @@ def _createConditionProtos(
         if price:
             cp.price = price
         # ``triggerMethod`` value 0 means "Default" — a valid wire
-        # value that IBKR's reference encoder writes via
-        # ``isValidIntValue``. Only treat the UNSET_INTEGER sentinel as
+        # value. Only treat the UNSET_INTEGER sentinel as
         # "skip"; a 0 must still be written so the server doesn't fall
         # back to its own default unexpectedly.
         condTriggerMethod = getattr(c, "triggerMethod", UNSET_INTEGER)
@@ -641,9 +632,9 @@ _CONDITION_CLASSES: dict[int, type[OrderCondition]] = {
 def _decodeConditions(
     proto: Order_pb2.Order,
 ) -> list[OrderCondition]:
-    """Mirror IBKR's ``decodeConditions`` — a flat repeated proto with
-    a ``type`` discriminator dispatches to the per-subclass field set.
-    Unknown ``type`` values are silently skipped (matches the reference).
+    """Decode the flat repeated conditions proto: a ``type``
+    discriminator dispatches to the per-subclass field set. Unknown
+    ``type`` values are silently skipped.
     """
     out: list[OrderCondition] = []
     for cp in proto.conditions:
@@ -685,8 +676,8 @@ def _decodeConditions(
 
 
 def _decodeSoftDollarTier(proto: Order_pb2.Order) -> SoftDollarTier | None:
-    """Mirror IBKR's ``decodeSoftDollarTierFromOrder``. Wire field is
-    ``value``; domain attribute is the legacy spelling ``val``.
+    """Decode the order's soft-dollar tier. Wire field is ``value``;
+    domain attribute is the legacy spelling ``val``.
     Returns ``None`` when the embedded message carries no fields, so
     the caller leaves the dataclass default in place.
     """
@@ -704,8 +695,8 @@ def _decodeSoftDollarTier(proto: Order_pb2.Order) -> SoftDollarTier | None:
 def _decodeOrderComboLegs(
     contractProto: Contract_pb2.Contract | None,
 ) -> list[OrderComboLeg]:
-    """Mirror IBKR's ``decodeOrderComboLegs`` — combo-leg per-leg prices
-    live on the contract proto's ``comboLegs`` list, NOT the order
+    """Decode the order's combo legs — combo-leg per-leg prices live on
+    the contract proto's ``comboLegs`` list, NOT the order
     proto. Returns an empty list when the contract proto is absent
     (e.g. the caller didn't propagate it).
     """
@@ -727,10 +718,9 @@ def createOrder(
 ) -> Order:
     """Decode a protobuf ``Order`` into our domain dataclass.
 
-    Mirrors IBKR's ``decoder_utils.decodeOrder`` field-by-field. The
-    ``contractProto`` arg carries the matching ``Contract`` message so
-    we can mirror IBKR's ``decodeOrderComboLegs`` (per-leg prices live
-    on the contract, not the order). The ``orderId`` arg lets the
+    The ``contractProto`` arg carries the matching ``Contract`` message
+    so we can decode the order's combo legs (per-leg prices live on the
+    contract, not the order). The ``orderId`` arg lets the
     envelope-level decoder propagate the wrapping message's orderId
     when the inner order proto omits it.
 
@@ -738,12 +728,9 @@ def createOrder(
     window (``customerAccount``, ``professionalCustomer``,
     ``bondAccruedInterest``, ``includeOvernight``, ``manualOrderIndicator``,
     ``submitter``) land on the corresponding ``Order`` dataclass
-    fields. Other reference fields not currently modelled on
-    ``Order`` (``deactivate``, ``postOnly``, ``allowPreOpen``,
-    ``ignoreOpenAuction``, ``seekPriceImprovement``, ``whatIfType``,
-    ``hedgeMaxSize``) are not surfaced here because the dataclass
-    has no slot for them — silently swallowing the wire data would
-    just hide user-invisible state.
+    fields, as do ``deactivate``, ``postOnly``, ``allowPreOpen``,
+    ``ignoreOpenAuction``, ``seekPriceImprovement``, ``whatIfType`` and
+    ``hedgeMaxSize``.
     """
     order = Order()
 
@@ -926,8 +913,6 @@ def createOrder(
         order.hedgeType = proto.hedgeType
         if proto.HasField("hedgeParam") and proto.hedgeType:
             order.hedgeParam = proto.hedgeParam
-    # ``hedgeMaxSize`` is on the wire but NOT on the Order dataclass —
-    # intentionally dropped here (see top-level docstring for the list).
 
     if proto.HasField("optOutSmartRouting"):
         order.optOutSmartRouting = proto.optOutSmartRouting
@@ -975,6 +960,8 @@ def createOrder(
         order.conditions = conditions
     if proto.HasField("conditionsIgnoreRth"):
         order.conditionsIgnoreRth = proto.conditionsIgnoreRth
+    if proto.HasField("conditionsIncludeOvernight"):
+        order.conditionsIncludeOvernight = proto.conditionsIncludeOvernight
     if proto.HasField("conditionsCancelOrder"):
         order.conditionsCancelOrder = proto.conditionsCancelOrder
 
@@ -1021,7 +1008,9 @@ def createOrder(
     if proto.HasField("minCompeteSize"):
         order.minCompeteSize = proto.minCompeteSize
     if proto.HasField("competeAgainstBestOffset"):
-        order.competeAgainstBestOffset = safe_decimal(proto.competeAgainstBestOffset)
+        order.competeAgainstBestOffset = decimalOrInfinity(
+            proto.competeAgainstBestOffset
+        )
     if proto.HasField("midOffsetAtWhole"):
         order.midOffsetAtWhole = safe_decimal(proto.midOffsetAtWhole)
     if proto.HasField("midOffsetAtHalf"):
@@ -1053,9 +1042,7 @@ def createOrder(
         order.imbalanceOnly = proto.imbalanceOnly
 
     # Order-misc + MIFID II + advancedErrorOverride + manualOrderTime —
-    # IBKR's reference reads these in ``processOpenOrderMsg`` (the
-    # binary path) but the proto schema places them on the Order
-    # message and ``decodeOrder`` itself does NOT read them. We do,
+    # the proto schema places these on the Order message. We read them
     # because these are first-class domain fields and dropping them
     # silently would lose user-set order metadata on every wire round
     # trip.
@@ -1150,8 +1137,7 @@ def createOrderStatus(proto: OrderStatus_pb2.OrderStatus) -> OrderStatus:
 def _decodeOrderAllocations(proto: OrderState_pb2.OrderState) -> list[OrderAllocation]:
     """Decode the repeated ``orderAllocations`` sub-messages on an
     OrderState into a list of frozen domain ``OrderAllocation`` records.
-    Mirrors IBKR's ``decodeOrderAllocations``; absent / empty repeated
-    field returns ``[]``.
+    An absent / empty repeated field returns ``[]``.
     """
     out: list[OrderAllocation] = []
     for a in proto.orderAllocations:
@@ -1443,12 +1429,11 @@ def _createAttachedOrdersProto(order: Order) -> AttachedOrders_pb2.AttachedOrder
     fields on the domain Order (``slOrderId`` / ``slOrderType`` /
     ``ptOrderId`` / ``ptOrderType``).
 
-    Mirrors IBKR's ``client_utils.createAttachedOrdersProto``. The wire
-    schema places these fields on a separate ``AttachedOrders`` message
-    that the ``PlaceOrderRequest`` envelope embeds — they are NOT on
-    ``Order_pb2.Order`` itself. Each field is gated by the standard
-    ``isValidIntValue`` / non-empty-string discipline so unset domain
-    defaults do not write sentinel values to the wire.
+    The wire schema places these fields on a separate ``AttachedOrders``
+    message that the ``PlaceOrderRequest`` envelope embeds — they are NOT
+    on ``Order_pb2.Order`` itself. Each field is gated by the standard
+    valid-int / non-empty-string discipline so unset domain defaults do
+    not write sentinel values to the wire.
     """
     proto = AttachedOrders_pb2.AttachedOrders()
     if _isValidInt(order.slOrderId):
@@ -1481,8 +1466,7 @@ def createPlaceOrderRequestProto(
     if _isValidInt(orderId):
         proto.orderId = orderId
     # Pass the order so per-leg pricing (BAG-secType only) lands on the
-    # ComboLeg proto's ``perLegPrice`` field. IBKR's reference signature
-    # is ``createContractProto(contract, order)``.
+    # ComboLeg proto's ``perLegPrice`` field.
     proto.contract.CopyFrom(createContractProto(contract, order))
     proto.order.CopyFrom(createOrderProto(order))
     proto.attachedOrders.CopyFrom(_createAttachedOrdersProto(order))
@@ -1552,7 +1536,7 @@ def createGlobalCancelRequestProto(
     manualOrderIndicator: int | None = None,
 ) -> GlobalCancelRequest_pb2.GlobalCancelRequest:
     """Encode a GlobalCancelRequest. CME-tagging fields land on the
-    nested ``orderCancel`` envelope, matching IBKR's reference shape."""
+    nested ``orderCancel`` envelope."""
     proto = GlobalCancelRequest_pb2.GlobalCancelRequest()
     if manualOrderCancelTime:
         proto.orderCancel.manualOrderCancelTime = manualOrderCancelTime
@@ -1575,8 +1559,8 @@ def createExecutionFilterProto(
     normalize_none_scalars(execFilter)
 
     proto = ExecutionFilter_pb2.ExecutionFilter()
-    # IBKR gates ``clientId`` on ``isValidIntValue`` — ``0`` is the
-    # documented "no client filter" wire value and must flow through.
+    # ``0`` is the documented "no client filter" wire value for
+    # ``clientId`` and must flow through; only the UNSET sentinel is skipped.
     if _isValidInt(execFilter.clientId):
         proto.clientId = execFilter.clientId
     if execFilter.acctCode:
@@ -1593,9 +1577,8 @@ def createExecutionFilterProto(
         proto.side = execFilter.side
     # ``lastNDays`` / ``specificDates`` ship past
     # ``MIN_SERVER_VER_PARAMETRIZED_DAYS_OF_EXECUTIONS`` (200). The
-    # gating is the caller's responsibility (mirrors IBKR's reference);
-    # the encoder unconditionally writes when the domain field carries
-    # a non-sentinel value.
+    # gating is the caller's responsibility; the encoder unconditionally
+    # writes when the domain field carries a non-sentinel value.
     if _isValidInt(execFilter.lastNDays):
         proto.lastNDays = execFilter.lastNDays
     if execFilter.specificDates:

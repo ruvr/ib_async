@@ -1,17 +1,39 @@
 """Programmatic control over the TWS/gateway client software."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import sys
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import ClassVar, Generic
 
 from eventkit import Event
 
-import ib_async.util as util
+from ib_async import util
 from ib_async.contract import Contract, Forex
 from ib_async.ib import IB
+from ib_async.objects import EmptyT
+
+# Each IBC option's command-line switch, (on Unix, on Windows): one ending
+# in "=" or ":" takes the value; "" is none (twsVersion goes first, bare).
+_SWITCHES: dict[str, tuple[str, str]] = {
+    "twsVersion": ("", ""),
+    "gateway": ("--gateway", "/Gateway"),
+    "tradingMode": ("--mode=", "/Mode:"),
+    "twsPath": ("--tws-path=", "/TwsPath:"),
+    "twsSettingsPath": ("--tws-settings-path=", ""),
+    "ibcPath": ("--ibc-path=", "/IbcPath:"),
+    "ibcIni": ("--ibc-ini=", "/Config:"),
+    "javaPath": ("--java-path=", "/JavaPath:"),
+    "userid": ("--user=", "/User:"),
+    "password": ("--pw=", "/PW:"),
+    "fixuserid": ("--fix-user=", "/FIXUser:"),
+    "fixpassword": ("--fix-pw=", "/FIXPW:"),
+    "on2fatimeout": ("--on2fatimeout=", "/On2FATimeout:"),
+}
 
 
 @dataclass
@@ -21,8 +43,9 @@ class IBC:
     using IBC (https://github.com/IbcAlpha/IBC).
 
     Args:
-        twsVersion (int): (required) The major version number for
-            TWS or gateway.
+        twsVersion (int | str): (required) The major version number for
+            TWS or gateway: 1019 on Windows and Linux, "10.19" on macOS
+            (a string, with the period, as in the macOS install folder).
         gateway (bool):
             * True = gateway
             * False = TWS
@@ -83,7 +106,7 @@ class IBC:
 
     IbcLogLevel: ClassVar = logging.DEBUG
 
-    twsVersion: int = 0
+    twsVersion: int | str
     gateway: bool = False
     tradingMode: str = ""
     twsPath: str = ""
@@ -98,12 +121,18 @@ class IBC:
     on2fatimeout: str = ""
 
     def __post_init__(self):
+        if not self.twsVersion:
+            # IBC's script fails without it, saying so only in its output;
+            # refused here, it cannot be retried for good by a Watchdog
+            raise ValueError("IBC needs twsVersion, the TWS or Gateway major version")
         self._isWindows = sys.platform == "win32"
         if not self.ibcPath:
             self.ibcPath = "/opt/ibc" if not self._isWindows else "C:\\IBC"
         self._proc = None
         self._monitor = None
         self._logger = logging.getLogger("ib_async.IBC")
+        self._warned: set[str] = set()
+        self._warnUnswitched()
 
     def __enter__(self):
         self.start()
@@ -124,25 +153,16 @@ class IBC:
         if self._proc:
             return
         self._logger.info("Starting")
-
-        # map from field names to cmd arguments; key=(UnixArg, WindowsArg)
-        args = dict(
-            twsVersion=("", ""),
-            gateway=("--gateway", "/Gateway"),
-            tradingMode=("--mode=", "/Mode:"),
-            twsPath=("--tws-path=", "/TwsPath:"),
-            twsSettingsPath=("--tws-settings-path=", ""),
-            ibcPath=("--ibc-path=", "/IbcPath:"),
-            ibcIni=("--ibc-ini=", "/Config:"),
-            javaPath=("--java-path=", "/JavaPath:"),
-            userid=("--user=", "/User:"),
-            password=("--pw=", "/PW:"),
-            fixuserid=("--fix-user=", "/FIXUser:"),
-            fixpassword=("--fix-pw=", "/FIXPW:"),
-            on2fatimeout=("--on2fatimeout=", "/On2FATimeout:"),
+        self._warnUnswitched()  # an option set since the IBC was made
+        self._proc = await asyncio.create_subprocess_exec(
+            *self._command(), stdout=asyncio.subprocess.PIPE
         )
+        self._monitor = asyncio.ensure_future(self.monitorAsync())
 
-        # create shell command
+    def _command(self) -> list[str]:
+        """The IBC start command for this configuration; an option IBC has
+        no switch for on this platform is left out (``_warnUnswitched``
+        warns of it)."""
         cmd = [
             (
                 f"{self.ibcPath}\\scripts\\StartIBC.bat"
@@ -151,20 +171,26 @@ class IBC:
             )
         ]
         for k, v in util.dataclassAsDict(self).items():
-            arg = args[k][self._isWindows]
+            arg = _SWITCHES[k][self._isWindows]
             if v:
-                if arg.endswith("=") or arg.endswith(":"):
+                if arg.endswith(("=", ":")):
                     cmd.append(f"{arg}{v}")
                 elif arg:
                     cmd.append(arg)
-                else:
+                elif k == "twsVersion":
                     cmd.append(str(v))
+        return cmd
 
-        # run shell command
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE
-        )
-        self._monitor = asyncio.ensure_future(self.monitorAsync())
+    def _warnUnswitched(self) -> None:
+        """Warn of each option set that IBC has no switch for on this
+        platform, once: when the IBC is made and before each start (a
+        Watchdog's every restart), only of one not warned of yet."""
+        platform = "Windows" if self._isWindows else sys.platform
+        for k, v in util.dataclassAsDict(self).items():
+            unswitched = v and k != "twsVersion" and not _SWITCHES[k][self._isWindows]
+            if unswitched and k not in self._warned:
+                self._warned.add(k)
+                self._logger.warning("IBC takes no %s on %s; left out", k, platform)
 
     async def terminateAsync(self):
         if not self._proc:
@@ -174,9 +200,12 @@ class IBC:
             self._monitor.cancel()
             self._monitor = None
         if self._isWindows:
-            import subprocess
-
-            subprocess.call(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)])
+            # Awaited, not a blocking subprocess.call: the event loop (and
+            # the Watchdog on it) keeps running while taskkill does.
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/T", "/PID", str(self._proc.pid)
+            )
+            await killer.wait()
         else:
             with suppress(ProcessLookupError):
                 self._proc.terminate()
@@ -202,7 +231,7 @@ class IBC:
                 line = await self._proc.stdout.readline()
             except (asyncio.CancelledError, GeneratorExit):
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 # Don't let a transient stdout read failure (e.g. a decode
                 # path raising, or a closed transport) silently kill the
                 # monitor task. Log and stop draining; the process owner
@@ -215,7 +244,7 @@ class IBC:
 
 
 @dataclass
-class Watchdog:
+class Watchdog(Generic[EmptyT]):
     """
     Start, connect and watch over the TWS or gateway app and try to keep it
     up and running. It is intended to be used in an event-driven
@@ -272,7 +301,7 @@ class Watchdog:
         * ``hardTimeoutEvent`` (watchdog: :class:`.Watchdog`)
     """
 
-    events = [
+    events: ClassVar[list[str]] = [
         "startingEvent",
         "startedEvent",
         "stoppingEvent",
@@ -282,7 +311,7 @@ class Watchdog:
     ]
 
     controller: IBC
-    ib: IB
+    ib: IB[EmptyT]
     host: str = "127.0.0.1"
     port: int = 7497
     clientId: int = 1
@@ -295,6 +324,10 @@ class Watchdog:
     raiseSyncErrors: bool = False
     probeContract: Contract = field(default_factory=lambda: Forex("EURUSD"))
     probeTimeout: float = 4
+    # Coroutine function used to wait for appStartupTime and retryDelay.
+    # Defaults to asyncio.sleep. Tests replace it so they do not wait on a
+    # real clock.
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
     def __post_init__(self):
         self.startingEvent = Event("startingEvent")
@@ -310,19 +343,41 @@ class Watchdog:
         if self.ib.isConnected():
             raise ValueError("IB instance must not be connected")
         self._runner = None
+        self._stopping = asyncio.Event()
         self._logger = logging.getLogger("ib_async.Watchdog")
 
     def start(self):
         self._logger.info("Starting")
         self.startingEvent.emit(self)
-        self._runner = asyncio.ensure_future(self.runAsync())
+        self._stopping = asyncio.Event()
+        self._runner = util.getLoop().create_task(self.runAsync())
         return self._runner
 
     def stop(self):
+        """Stop the Watchdog loop.
+
+        If a startup or retry wait is in progress, it ends immediately and
+        no further connection attempt is made.
+        """
         self._logger.info("Stopping")
         self.stoppingEvent.emit(self)
         self.ib.disconnect()
         self._runner = None
+        self._stopping.set()
+
+    async def _wait(self, delay: float) -> None:
+        """Wait ``delay`` seconds using ``self.sleep``.
+
+        Returns early if :meth:`stop` is called.
+        """
+        waiting = asyncio.ensure_future(self.sleep(delay))
+        stopped = asyncio.ensure_future(self._stopping.wait())
+        try:
+            await asyncio.wait({waiting, stopped}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (waiting, stopped):
+                if not pending.done():
+                    pending.cancel()
 
     async def runAsync(self):
         def onTimeout(idlePeriod):
@@ -340,7 +395,9 @@ class Watchdog:
         while self._runner:
             try:
                 await self.controller.startAsync()
-                await asyncio.sleep(self.appStartupTime)
+                await self._wait(self.appStartupTime)
+                if not self._runner:
+                    break  # stop() was called during the startup wait
                 await self.ib.connectAsync(
                     self.host,
                     self.port,
@@ -357,7 +414,7 @@ class Watchdog:
                 self.ib.disconnectedEvent += onDisconnected
 
                 while self._runner:
-                    waiter: asyncio.Future = asyncio.Future()
+                    waiter: asyncio.Future[None] = asyncio.Future()
                     await waiter
                     # soft timeout, probe the app with a historical request
                     self._logger.debug("Soft timeout")
@@ -377,8 +434,8 @@ class Watchdog:
                 pass
             except Warning as w:
                 self._logger.warning(w)
-            except Exception as e:
-                self._logger.exception(e)
+            except Exception:
+                self._logger.exception("Watchdog run failed")
             finally:
                 self.ib.timeoutEvent -= onTimeout
                 self.ib.errorEvent -= onError
@@ -386,7 +443,7 @@ class Watchdog:
                 await self.controller.terminateAsync()
                 self.stoppedEvent.emit(self)
                 if self._runner:
-                    await asyncio.sleep(self.retryDelay)
+                    await self._wait(self.retryDelay)
 
 
 if __name__ == "__main__":

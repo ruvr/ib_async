@@ -15,10 +15,13 @@ Designed to be used only by :mod:`ib_async.wrapper`.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Generic, Protocol, TypeVar
 
+from ib_async.objects import EmptyT
+from ib_async.runtime import SubscriptionState, Tally
 from ib_async.ticker import Ticker
 
 if TYPE_CHECKING:
@@ -42,12 +45,21 @@ _S = TypeVar("_S", bound="Subscription")
 # --------------------------------------------------------------------------
 
 
+class _Registered(Protocol):
+    """What a :class:`Subscription` needs from the registry it is in: the
+    client to send its cancel with, and the indexes to leave on close."""
+
+    def _cancelClient(self) -> Client | None: ...
+
+    def _unregister(self, sub: Subscription) -> None: ...
+
+
 @dataclass
 class Subscription:
     """Lifecycle-aware base class for live IB data flows.
 
-    Subclasses fill in ``KIND`` (used by the registry to index by
-    ``(conId, kind)`` for market-data-style subscriptions), ``ticker``
+    Subclasses fill in ``KIND`` (used by the registry to index
+    market-data-style subscriptions by contract identity and kind), ``ticker``
     or another accumulator field, and the two protocol hooks
     ``_send_cancel`` and ``_set_done``.
 
@@ -71,7 +83,7 @@ class Subscription:
 
     # Set by :meth:`SubscriptionRegistry.add`. Cleared on close. Not part
     # of the public API.
-    _registry: SubscriptionRegistry | None = field(default=None, repr=False)
+    _registry: _Registered | None = field(default=None, repr=False)
 
     # ---- public API ------------------------------------------------------
 
@@ -94,8 +106,8 @@ class Subscription:
         self.closed = True
         registry = self._registry
         try:
-            if send_cancel and registry is not None and registry._wrapper is not None:
-                client = registry._wrapper.ib.client
+            if send_cancel and registry is not None:
+                client = registry._cancelClient()
                 if client is not None:
                     self._send_cancel(client)
         finally:
@@ -117,22 +129,30 @@ class Subscription:
         (bars list, scanner data list) override.
         """
 
+    def _movedTo(self, reqId: int) -> None:
+        """Take ``reqId`` as this subscription's own (it was sent again
+        under it). Subclasses whose subscriber object carries the reqId
+        (a bars list) keep it in step."""
+        self.reqId = reqId
+
 
 # ---- market-data family -----------------------------------------------------
 
 
 @dataclass
-class MktDataSub(Subscription):
+class MktDataSub(Subscription, Generic[EmptyT]):
     """``IB.reqMktData`` — streaming top-of-book + generic ticks.
 
-    The :class:`Ticker` is pooled per-contract across mktData /
-    tickByTick / mktDepth and is therefore *not* set-done on close;
-    other subscriptions on the same contract may still be active.
+    A streaming subscription's :class:`Ticker` is shared per contract by
+    mktData, tickByTick and mktDepth, so it is *not* set done on close:
+    other subscriptions on the same contract may still be active. A
+    snapshot has its own Ticker, which is set done when the snapshot ends
+    because nothing will update it again.
     """
 
     KIND: ClassVar[str | None] = "mktData"
 
-    ticker: Ticker = None  # type: ignore[assignment]
+    ticker: Ticker[EmptyT] = None  # type: ignore[assignment]
     snapshot: bool = False
     genericTickList: str = ""
 
@@ -142,9 +162,13 @@ class MktDataSub(Subscription):
         if not self.snapshot:
             client.cancelMktData(self.reqId)
 
+    def _set_done(self) -> None:
+        if self.snapshot and self.ticker is not None:
+            self.ticker.updateEvent.set_done()
+
 
 @dataclass
-class TickByTickSub(Subscription):
+class TickByTickSub(Subscription, Generic[EmptyT]):
     """``IB.reqTickByTickData`` — per-trade or per-quote stream.
 
     The four IB tick types (``"Last"``, ``"AllLast"``, ``"BidAsk"``,
@@ -154,7 +178,7 @@ class TickByTickSub(Subscription):
     instance can have its own kind without mutating shared state.
     """
 
-    ticker: Ticker = None  # type: ignore[assignment]
+    ticker: Ticker[EmptyT] = None  # type: ignore[assignment]
     tickType: str = ""
 
     def _send_cancel(self, client: Client) -> None:
@@ -162,12 +186,12 @@ class TickByTickSub(Subscription):
 
 
 @dataclass
-class MktDepthSub(Subscription):
+class MktDepthSub(Subscription, Generic[EmptyT]):
     """``IB.reqMktDepth`` — DOM (level-2) book updates."""
 
     KIND: ClassVar[str | None] = "mktDepth"
 
-    ticker: Ticker = None  # type: ignore[assignment]
+    ticker: Ticker[EmptyT] = None  # type: ignore[assignment]
     isSmartDepth: bool = False
 
     def _send_cancel(self, client: Client) -> None:
@@ -190,6 +214,11 @@ class RealTimeBarsSub(Subscription):
         if self.bars is not None:
             self.bars.updateEvent.set_done()
 
+    def _movedTo(self, reqId: int) -> None:
+        super()._movedTo(reqId)
+        if self.bars is not None:
+            self.bars.reqId = reqId
+
 
 @dataclass
 class HistoricalBarsSub(Subscription):
@@ -203,6 +232,11 @@ class HistoricalBarsSub(Subscription):
     def _set_done(self) -> None:
         if self.bars is not None:
             self.bars.updateEvent.set_done()
+
+    def _movedTo(self, reqId: int) -> None:
+        super()._movedTo(reqId)
+        if self.bars is not None:
+            self.bars.reqId = reqId
 
 
 @dataclass
@@ -252,7 +286,8 @@ class PnLSingleSub(Subscription):
 # --------------------------------------------------------------------------
 
 
-class SubscriptionRegistry:
+@dataclass(slots=True, eq=False)
+class SubscriptionRegistry(Generic[EmptyT]):
     """Owns lifecycle and lookup for every live :class:`Subscription`.
 
     The registry is the single source of truth: every index it holds is
@@ -266,38 +301,40 @@ class SubscriptionRegistry:
     its cancel. The reference is set at construction time.
     """
 
-    __slots__ = (
-        "_wrapper",
-        "_by_reqid",
-        "_ticker_by_reqid",
-        "_tickers",
-        "_by_market_data_key",
-        "_by_pnl_key",
-        "_by_pnl_single_key",
+    # The owning Wrapper, for a Subscription.close to find the IB client.
+    _wrapper: Wrapper[EmptyT] | None = field(default=None, repr=False)
+    # The session's counters (ib_async.runtime), shared with the registry
+    # that replaces this one after a disconnect.
+    tally: Tally = field(default_factory=Tally, repr=False)
+    _by_reqid: dict[int, Subscription] = field(default_factory=dict, init=False)
+    # Hot-path view; equal value identity to ``MktDataSub.ticker`` /
+    # ``TickByTickSub.ticker`` / ``MktDepthSub.ticker`` for the same
+    # reqId. Tick handlers do one dict.get on this map.
+    _ticker_by_reqid: dict[int, Ticker[EmptyT]] = field(
+        default_factory=dict, init=False
     )
-
-    def __init__(self, wrapper: Wrapper | None = None) -> None:
-        self._wrapper: Wrapper | None = wrapper
-        self._by_reqid: dict[int, Subscription] = {}
-        # Hot-path view; equal value identity to ``MktDataSub.ticker`` /
-        # ``TickByTickSub.ticker`` / ``MktDepthSub.ticker`` for the same
-        # reqId. Tick handlers do one dict.get on this map.
-        self._ticker_by_reqid: dict[int, Ticker] = {}
-        # Per-contract Ticker pool. The same Ticker is shared across all
-        # market-data shapes (mktData / tickByTick / mktDepth / snapshot)
-        # for a given contract so a single Ticker reflects every live
-        # tick stream. Keyed by ``hash(contract)`` (which uses conId).
-        self._tickers: dict[int, Ticker] = {}
-        # (identity, kind) -> Subscription, where identity is the
-        # contract's market-data identity (its conId, or a bag's synthetic
-        # comboLeg hash — see _market_data_identity) and kind is the
-        # IB-level market-data type ("mktData", "Last", "AllLast",
-        # "BidAsk", "MidPoint", "mktDepth").
-        self._by_market_data_key: dict[tuple[int, str], Subscription] = {}
-        # (account, modelCode) -> PnLSub.
-        self._by_pnl_key: dict[tuple[str, str], PnLSub] = {}
-        # (account, modelCode, conId) -> PnLSingleSub.
-        self._by_pnl_single_key: dict[tuple[str, str, int], PnLSingleSub] = {}
+    # Per-contract Ticker pool. The same Ticker is shared across all
+    # market-data shapes (mktData / tickByTick / mktDepth / snapshot)
+    # for a given contract so a single Ticker reflects every live
+    # tick stream. Keyed by ``hash(contract)``, as the market-data index.
+    _tickers: dict[int, Ticker[EmptyT]] = field(default_factory=dict, init=False)
+    # Keys of pooled Tickers some stream's request was sent for (see
+    # sending). A pooled Ticker no request was ever sent for is dropped
+    # from the pool when its send raises.
+    _sentFor: set[int] = field(default_factory=set, init=False)
+    # (identity, kind) -> Subscription, where identity is the
+    # contract's hash (see _market_data_identity) and kind is the
+    # IB-level market-data type ("mktData", "Last", "AllLast",
+    # "BidAsk", "MidPoint", "mktDepth").
+    _by_market_data_key: dict[tuple[int, str], Subscription] = field(
+        default_factory=dict, init=False
+    )
+    # (account, modelCode) -> PnLSub.
+    _by_pnl_key: dict[tuple[str, str], PnLSub] = field(default_factory=dict, init=False)
+    # (account, modelCode, conId) -> PnLSingleSub.
+    _by_pnl_single_key: dict[tuple[str, str, int], PnLSingleSub] = field(
+        default_factory=dict, init=False
+    )
 
     # ---- registration ---------------------------------------------------
 
@@ -309,7 +346,11 @@ class SubscriptionRegistry:
         ``(identity, kind)`` pair (caller should idempotently dedupe via
         :meth:`find_market_data_for_contract` first).
         """
+        self._index(sub)
+        self.tally.subscriptionsAdded += 1
 
+    def _index(self, sub: Subscription) -> None:
+        """Enter ``sub`` in every index (see :meth:`add`)."""
         if sub.reqId in self._by_reqid:
             raise KeyError(f"reqId {sub.reqId} already registered")
 
@@ -336,9 +377,65 @@ class SubscriptionRegistry:
 
         sub._registry = self
 
+    @contextlib.contextmanager
+    def sending(self, sub: Subscription | None) -> Iterator[None]:
+        """Register ``sub`` for the block that sends its request.
+
+        The block holds the wire ``client.req*`` call. If it raises (the
+        encoder refused an argument), nothing was sent, so ``sub`` is
+        closed without a cancel and the exception propagates. Left
+        registered, a market-data subscription would make the corrected
+        call return a Ticker that never updates, since streams are
+        deduplicated by contract. ``add`` runs before the block, so a
+        duplicate is refused before anything is sent. ``None`` registers
+        nothing, for a request that has no subscription.
+
+        A pooled Ticker created for this call, that no request was ever
+        sent for, leaves the pool too, so ``IB.tickers()`` does not list a
+        contract never subscribed. One that served a stream stays, with
+        its data and its identity for a caller holding it.
+        """
+        if sub is not None:
+            self.add(sub)
+        try:
+            yield
+        except BaseException:
+            if sub is not None:
+                self.tally.subscriptionsNotSent += 1
+                sub.close(send_cancel=False)
+                key = self._pooledKey(sub)
+                if key is not None and key not in self._sentFor:
+                    del self._tickers[key]
+            raise
+        if sub is not None and (key := self._pooledKey(sub)) is not None:
+            self._sentFor.add(key)
+
+    def _pooledKey(self, sub: Subscription) -> int | None:
+        """The pool key of ``sub``'s Ticker, or None if it is not pooled.
+
+        Only streams use pooled Tickers; their contracts are hashable. A
+        snapshot's Ticker is private, and its contract may be unqualified,
+        which has no hash."""
+        if isinstance(sub, MktDataSub):
+            if sub.snapshot:
+                return None
+        elif not isinstance(sub, TickByTickSub | MktDepthSub):
+            return None
+        key = hash(sub.contract)
+        return key if self._tickers.get(key) is sub.ticker else None
+
+    def _cancelClient(self) -> Client | None:
+        """The IB client a closing subscription sends its cancel with."""
+
+        return self._wrapper.ib.client if self._wrapper is not None else None
+
     def _unregister(self, sub: Subscription) -> None:
         """Remove ``sub`` from every index. Called from :meth:`Subscription.close`."""
+        self._unindex(sub)
+        self.tally.subscriptionsEnded += 1
 
+    def _unindex(self, sub: Subscription) -> None:
+        """Remove ``sub`` from every index (see :meth:`_unregister`)."""
         self._by_reqid.pop(sub.reqId, None)
         self._ticker_by_reqid.pop(sub.reqId, None)
 
@@ -353,6 +450,13 @@ class SubscriptionRegistry:
         elif isinstance(sub, PnLSingleSub):
             self._by_pnl_single_key.pop((sub.account, sub.modelCode, sub.conId), None)
 
+    def move(self, sub: Subscription, reqId: int) -> None:
+        """Register ``sub`` under ``reqId`` instead (it was sent again
+        under it). The subscription goes on, so nothing is counted."""
+        self._unindex(sub)
+        sub._movedTo(reqId)
+        self._index(sub)
+
     # ---- queries --------------------------------------------------------
 
     def get_sub(self, reqId: int) -> Subscription | None:
@@ -360,14 +464,14 @@ class SubscriptionRegistry:
 
         return self._by_reqid.get(reqId)
 
-    def get_ticker(self, reqId: int) -> Ticker | None:
+    def get_ticker(self, reqId: int) -> Ticker[EmptyT] | None:
         """Hot-path lookup: one ``dict.get`` to find the ticker for a tick reqId."""
 
         return self._ticker_by_reqid.get(reqId)
 
     # ---- ticker pool ----------------------------------------------------
 
-    def get_or_create_ticker(self, contract: Contract) -> Ticker:
+    def get_or_create_ticker(self, contract: Contract) -> Ticker[EmptyT]:
         """Return the pooled :class:`Ticker` for ``contract``, allocating
         one with the wrapper's :class:`IBDefaults` if no entry exists yet.
         """
@@ -386,7 +490,7 @@ class SubscriptionRegistry:
             self._tickers[key] = ticker
         return ticker
 
-    def new_snapshot_ticker(self, contract: Contract) -> Ticker:
+    def new_snapshot_ticker(self, contract: Contract) -> Ticker[EmptyT]:
         """Allocate a fresh, *unpooled* :class:`Ticker` for a one-shot snapshot.
 
         Unlike :meth:`get_or_create_ticker`, the returned Ticker is **not**
@@ -416,33 +520,34 @@ class SubscriptionRegistry:
             )
         return Ticker(contract=contract, defaults=self._wrapper.defaults)
 
-    def ticker_for_contract(self, contract: Contract) -> Ticker | None:
+    def ticker_for_contract(self, contract: Contract) -> Ticker[EmptyT] | None:
         """Return the pooled Ticker for ``contract`` if one exists. Used
         by :meth:`IB.ticker` as the public lookup."""
 
         return self._tickers.get(hash(contract))
 
-    def pooled_tickers(self) -> list[Ticker]:
+    def pooled_tickers(self) -> list[Ticker[EmptyT]]:
         """Snapshot of every pooled Ticker. Used by :meth:`IB.tickers`
         and by :meth:`Wrapper.connectionClosed` to set done on every
         Ticker's ``updateEvent``."""
 
         return list(self._tickers.values())
 
-    def find_market_data(self, conId: int, kind: str) -> Subscription | None:
+    def find_market_data(self, identity: int, kind: str) -> Subscription | None:
         """Low-level lookup of a market-data subscription by its index
         *identity int* and ``kind``.
 
-        The identity is a contract's ``conId`` for qualified contracts and
-        a bag's synthetic comboLeg hash for spreads (see
-        :meth:`_market_data_identity`). Callers that hold the
-        :class:`Contract` should prefer :meth:`find_market_data_for_contract`,
-        which resolves the identity for them — critically for bags, whose
-        ``conId`` is always ``0`` and so can never be found via this
-        raw-conId entry point.
+        The identity is a contract's hash (see
+        :meth:`_market_data_identity`): its ``conId`` for a qualified
+        contract, negated for a CONTFUT, and a bag's synthetic comboLeg
+        hash. Callers that hold the :class:`Contract` should prefer
+        :meth:`find_market_data_for_contract`, which resolves the identity
+        for them — critically for bags, which are indexed by their legs,
+        never by their ``conId`` (often 0, and shared by many different
+        spreads), and so can never be found by ``conId`` here.
         """
 
-        return self._by_market_data_key.get((conId, kind))
+        return self._by_market_data_key.get((identity, kind))
 
     def find_market_data_for_contract(
         self, contract: Contract, kind: str
@@ -454,7 +559,7 @@ class SubscriptionRegistry:
         ``IB.reqMktDepth`` for idempotent re-subscribe (the second call
         returns the existing subscription instead of double-billing) and by
         the matching ``IB.cancel*`` methods to find the subscription to
-        close. Bags/spreads carry ``conId == 0`` but resolve to their
+        close. Bags/spreads (whatever their ``conId``) resolve to their
         conId-independent synthetic comboLeg hash, so they are found here
         (a raw ``find_market_data(contract.conId, kind)`` call could never
         locate them). Returns ``None`` for unindexable contracts
@@ -545,6 +650,43 @@ class SubscriptionRegistry:
         for sub in list(self._by_reqid.values()):
             sub.close(send_cancel=send_cancel)
 
+    def state(self) -> SubscriptionState:
+        """The live subscriptions, by kind."""
+        marketData = snapshots = tickByTick = depth = 0
+        realTimeBars = historicalBars = scanners = pnl = pnlSingle = 0
+        for sub in self._by_reqid.values():
+            if isinstance(sub, MktDataSub):
+                if sub.snapshot:
+                    snapshots += 1
+                else:
+                    marketData += 1
+            elif isinstance(sub, TickByTickSub):
+                tickByTick += 1
+            elif isinstance(sub, MktDepthSub):
+                depth += 1
+            elif isinstance(sub, RealTimeBarsSub):
+                realTimeBars += 1
+            elif isinstance(sub, HistoricalBarsSub):
+                historicalBars += 1
+            elif isinstance(sub, ScannerSub):
+                scanners += 1
+            elif isinstance(sub, PnLSub):
+                pnl += 1
+            elif isinstance(sub, PnLSingleSub):
+                pnlSingle += 1
+        return SubscriptionState(
+            marketData=marketData,
+            snapshots=snapshots,
+            tickByTick=tickByTick,
+            marketDepth=depth,
+            realTimeBars=realTimeBars,
+            historicalBars=historicalBars,
+            scanners=scanners,
+            pnl=pnl,
+            pnlSingle=pnlSingle,
+            pooledTickers=len(self._tickers),
+        )
+
     # ---- internals ------------------------------------------------------
 
     @staticmethod
@@ -582,30 +724,23 @@ class SubscriptionRegistry:
         """Stable identity int used as the first element of the
         ``(identity, kind)`` market-data index key.
 
-          * Qualified contracts → their ``conId``. This is the historical
-            key (the index used to be ``(conId, kind)``), so qualified
-            contracts — including CONTFUT, which keeps its positive
-            ``conId`` here rather than the negated value
-            :meth:`Contract.__hash__` produces — behave exactly as before.
-          * Bags/spreads → ``hash(contract)``, the conId-independent
-            synthetic comboLeg hash from :meth:`Contract.__hash__`. A bag
-            always carries ``conId == 0``, so under the raw-conId scheme it
-            could never be indexed — and therefore never deduped on
-            re-subscribe, nor *cancelled by contract*
-            (``IB.cancelMktData(bag)`` silently returned False and leaked
-            the live combo stream). Its synthetic hash gives every distinct
-            spread its own entry. (Like the per-contract Ticker pool, which
-            is also keyed by ``hash(contract)``, this carries the same
-            vanishingly small chance of colliding with a qualified
-            contract's ``conId``.)
+          * Qualified contracts → ``hash(contract)``: their ``conId``,
+            negated for a CONTFUT, which is not the front future it shares
+            its conId with (as :meth:`Contract.__eq__` says, and as the
+            Ticker pool keys it), so the two never share a subscription.
+          * Bags/spreads → ``hash(contract)``, the synthetic comboLeg hash
+            from :meth:`Contract.__hash__`, whatever their conId: a bag's
+            conId is often 0, and IBKR gives many different spreads one
+            combo conId, so only the legs tell spreads apart. Each distinct
+            spread gets its own entry, deduped on re-subscribe and
+            cancellable by contract. (Like the per-contract Ticker pool,
+            also keyed by ``hash(contract)``, this carries a vanishingly
+            small chance of colliding with a qualified contract's
+            ``conId``.)
           * Genuinely-unqualified contracts (``conId == 0`` and not a
             ``BAG``) → ``None``: they have no stable identity, so multiple
             unrelated callers must NOT collapse into a single ``(0, kind)``
             entry (``hash()`` of such a contract also raises).
         """
 
-        if contract.conId:
-            return contract.conId
-        if contract.secType == "BAG":
-            return hash(contract)
-        return None
+        return hash(contract) if contract.isHashable() else None
