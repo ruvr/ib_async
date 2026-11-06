@@ -12,6 +12,7 @@ from __future__ import annotations
 import struct
 
 import ib_async as ibi
+from ib_async._pb import ManagedAccounts_pb2, NextValidId_pb2
 from ib_async._pb_msgids import (
     MIN_SERVER_VER_PROTOBUF,
     MIN_SERVER_VER_PROTOBUF_PLACE_ORDER,
@@ -41,10 +42,11 @@ def test_protobuf_msg_ids_table_covers_known_messages():
 
 
 def test_protobuf_msg_ids_table_size_matches_ibkr_reference():
-    # IBKR's ibapi/common.py:55-136 ships 79 entries; if the upstream
-    # adds a new message family, this test will fail loudly so we have
-    # to make a deliberate decision about syncing.
-    assert len(PROTOBUF_MSG_IDS) == 79
+    # The protocol gates 77 messages onto protobuf by server version;
+    # if IBKR adds or drops a message family, this
+    # test will fail loudly so we have to make a deliberate decision
+    # about syncing.
+    assert len(PROTOBUF_MSG_IDS) == 77
 
 
 # --- useProtoBuf boundary behaviour --------------------------------------
@@ -210,7 +212,6 @@ def test_proto_path_snoops_next_valid_id_and_managed_accounts_to_fire_api_start(
     # ``apiStart`` lives in ``_onSocketHasData`` and used to run only in
     # the binary branch, so the apiStart event never emitted on a fully
     # protobuf session — ``connectAsync`` timed out at ``apiStart``.
-    from ib_async._pb import ManagedAccounts_pb2, NextValidId_pb2
 
     ib = ibi.IB()
     ib.client._serverVersion = 214

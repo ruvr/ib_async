@@ -9,6 +9,8 @@ SubscriptionRegistry the same way mktData does after Stage E.
     via the IB client, and removes every bookkeeping trace.
 """
 
+from __future__ import annotations
+
 from unittest.mock import MagicMock
 
 import ib_async as ibi
@@ -111,21 +113,20 @@ def test_cancelMktDepth_closes_via_registry_and_clears_dom():
     ib = _wired_ib()
     contract = _stock(22)
     ticker = ib.reqMktDepth(contract, isSmartDepth=True)
-    # Seed the DOM lists so we can verify the cancel-time clearing.
-    ticker.domBids.append(object())
-    ticker.domAsks.append(object())
-    ticker.domBidsDict[0] = object()
-    ticker.domAsksDict[0] = object()
+    # Seed the book so we can verify the cancel-time clearing.
+    ticker.dom.apply(1, 0, 0, 100.0, 1.0)
+    ticker.dom.apply(0, 0, 0, 101.0, 1.0)
 
     ib.cancelMktDepth(contract, isSmartDepth=True)
 
     ib.client.cancelMktDepth.assert_called_once()
-    (called_reqId, called_smart), _ = ib.client.cancelMktDepth.call_args
+    (_called_reqId, called_smart), _ = ib.client.cancelMktDepth.call_args
     assert called_smart is True
     assert ib.wrapper.subscriptions.find_market_data(22, "mktDepth") is None
     # DOM state cleared on cancel.
-    assert ticker.domBids == []
-    assert ticker.domAsks == []
+    assert not ticker.dom
+    assert ticker.domBids == ()
+    assert ticker.domAsks == ()
     assert ticker.domBidsDict == {}
     assert ticker.domAsksDict == {}
 

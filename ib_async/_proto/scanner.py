@@ -1,4 +1,4 @@
-"""Protobuf converters for scanner, fundamentals, and PnL.
+"""Protobuf converters for scanner and PnL.
 
 Pure functions: every converter takes only proto inputs (or domain
 inputs on the send side). No reads from module-level state, no
@@ -22,9 +22,9 @@ Wire-shape notes:
   dataclass plus both wire map fields:
   ``scannerSubscriptionFilterOptions`` (the documented per-instrument
   generic filter options shipped on TWS >= MIN_SERVER_VER_SCANNER_GENERIC_OPTS)
-  and ``scannerSubscriptionOptions`` (IBKR-internal, kept for parity).
-* ``FundamentalsDataRequest`` and the news-side requests (article /
-  historical news) carry trailing ``map<string, string>`` option fields
+  and ``scannerSubscriptionOptions`` (IBKR-internal).
+* The news-side requests (article / historical news) carry trailing
+  ``map<string, string>`` option fields
   — these are TagValue lists on the public surface; pass-through must
   preserve them or the proto path silently drops user-provided options
   the binary path would have shipped.
@@ -36,12 +36,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from .._pb import (
-    CancelFundamentalsData_pb2,
     CancelPnL_pb2,
     CancelPnLSingle_pb2,
     CancelScannerSubscription_pb2,
-    FundamentalsData_pb2,
-    FundamentalsDataRequest_pb2,
     PnL_pb2,
     PnLRequest_pb2,
     PnLSingle_pb2,
@@ -56,7 +53,7 @@ from .._pb import (
 from ..contract import Contract, ContractDetails, TagValue
 from ..objects import ScannerSubscription
 from ..util import UNSET_INTEGER
-from .contracts import createContract, createContractProto
+from .contracts import createContract
 from .safe import (
     fill_tag_value_map,
     normalize_none_scalars,
@@ -97,14 +94,6 @@ class ScannerDataArgs:
 
     reqId: int
     elements: list[ScannerDataElementArgs]
-
-
-@dataclass(slots=True, frozen=True)
-class FundamentalDataArgs:
-    """Args for ``Wrapper.fundamentalData(reqId, data)``."""
-
-    reqId: int
-    data: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -193,53 +182,6 @@ def createScannerParametersXml(proto: ScannerParameters_pb2.ScannerParameters) -
 
 
 # ---------------------------------------------------------------------------
-# FundamentalsData (msgId 51 receive) + request / cancel
-# ---------------------------------------------------------------------------
-
-
-def createFundamentalDataArgs(
-    proto: FundamentalsData_pb2.FundamentalsData,
-) -> FundamentalDataArgs:
-    """``Wrapper.fundamentalData(reqId, data)`` args."""
-    reqId = proto.reqId if proto.HasField("reqId") else 0
-    data = proto.data if proto.HasField("data") else ""
-    return FundamentalDataArgs(reqId=reqId, data=data)
-
-
-def createFundamentalsDataRequestProto(
-    reqId: int,
-    contract: Contract,
-    reportType: str,
-    fundamentalsDataOptions: list[TagValue] | None = None,
-) -> FundamentalsDataRequest_pb2.FundamentalsDataRequest:
-    """Build a ``FundamentalsDataRequest`` envelope.
-
-    ``fundamentalsDataOptions`` is the documented TagValue trailer the
-    binary path sends after ``reportType``. The proto wire spells it
-    ``fundamentalsDataOptions`` (a ``map<string, string>``); empty /
-    ``None`` lists leave the field unset — matching IBKR's
-    ``client_utils.createFundamentalsDataRequestProto``.
-    """
-    proto = FundamentalsDataRequest_pb2.FundamentalsDataRequest()
-    if reqId != UNSET_INTEGER:
-        proto.reqId = reqId
-    proto.contract.CopyFrom(createContractProto(contract))
-    if reportType:
-        proto.reportType = reportType
-    fill_tag_value_map(fundamentalsDataOptions, proto.fundamentalsDataOptions)
-    return proto
-
-
-def createCancelFundamentalsDataProto(
-    reqId: int,
-) -> CancelFundamentalsData_pb2.CancelFundamentalsData:
-    proto = CancelFundamentalsData_pb2.CancelFundamentalsData()
-    if reqId != UNSET_INTEGER:
-        proto.reqId = reqId
-    return proto
-
-
-# ---------------------------------------------------------------------------
 # PnL (msgId 94 receive) + request / cancel
 # ---------------------------------------------------------------------------
 
@@ -266,7 +208,7 @@ def createPnLArgs(proto: PnL_pb2.PnL) -> PnLArgs:
 def createPnLRequestProto(
     reqId: int, account: str, modelCode: str
 ) -> PnLRequest_pb2.PnLRequest:
-    # Mirror IBKR's gating: empty ``modelCode`` MUST NOT reach the wire
+    # Empty ``modelCode`` MUST NOT reach the wire
     # (otherwise the server returns Error 321: Model name '' is incorrect).
     proto = PnLRequest_pb2.PnLRequest()
     if reqId != UNSET_INTEGER:
@@ -317,7 +259,7 @@ def createPnLSingleArgs(proto: PnLSingle_pb2.PnLSingle) -> PnLSingleArgs:
 def createPnLSingleRequestProto(
     reqId: int, account: str, modelCode: str, conId: int
 ) -> PnLSingleRequest_pb2.PnLSingleRequest:
-    # Mirror IBKR's gating; empty modelCode must NOT be written.
+    # Empty modelCode must NOT be written.
     proto = PnLSingleRequest_pb2.PnLSingleRequest()
     if reqId != UNSET_INTEGER:
         proto.reqId = reqId
@@ -353,20 +295,19 @@ def createScannerSubscriptionProto(
     ``marketCapAbove`` etc.) default to ``None`` on the domain
     dataclass — the universal unset marker. ``None`` skips the wire
     write entirely so the proto field stays unset when the user didn't
-    provide a filter; mirrors IBKR's ``isValidFloatValue`` /
-    ``isValidIntValue`` gating. ``Decimal``-typed filters are coerced
+    provide a filter, as the IBKR server expects of unset numbers.
+    ``Decimal``-typed filters are coerced
     through ``float()`` for the proto's wire ``double`` slot.
 
     ``numberOfRows`` keeps its legacy ``int = -1`` default (an explicit
     "all rows" marker the IBKR server understands); the ``_isValidInt``
     gate would also accept ``-1`` so the write goes through unchanged.
 
-    Both option lists are TagValue trailers IBKR's reference encoder
-    writes verbatim into the proto's ``map<string, string>`` fields. The
-    *filter* options carry the documented per-instrument generic filter
-    settings (server >= MIN_SERVER_VER_SCANNER_GENERIC_OPTS); the
-    other is IBKR-internal but accepted for parity. Empty / ``None``
-    lists leave the wire fields unset.
+    Both option lists are TagValue trailers written verbatim into the
+    proto's ``map<string, string>`` fields. The *filter* options carry
+    the documented per-instrument generic filter settings (server >=
+    MIN_SERVER_VER_SCANNER_GENERIC_OPTS); the other is IBKR-internal but
+    accepted. Empty / ``None`` lists leave the wire fields unset.
     """
     # Wire-boundary coalesce: if a caller stomps ``None`` onto a plain-
     # scalar field (e.g. ``sub.numberOfRows = None``), restore the
@@ -432,8 +373,7 @@ def createScannerSubscriptionRequestProto(
 ) -> ScannerSubscriptionRequest_pb2.ScannerSubscriptionRequest:
     """Build the full ``ScannerSubscriptionRequest`` envelope.
 
-    Mirrors IBKR's ``client_utils.createScannerSubscriptionRequestProto``:
-    ``reqId`` plus the nested ``ScannerSubscription`` (which carries
+    Carries ``reqId`` plus the nested ``ScannerSubscription`` (which carries
     both TagValue trailer maps directly on the wire).
     """
     proto = ScannerSubscriptionRequest_pb2.ScannerSubscriptionRequest()

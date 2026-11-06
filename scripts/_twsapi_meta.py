@@ -1,20 +1,15 @@
 """TWS API version pin — single source of truth in pyproject.toml.
 
 Reads ``[tool.ib_async.twsapi]`` so ``scripts/generate_protos.py``,
-``scripts/release.py``, ``scripts/audit_proto_parity.py``, and CI
-all consume one version + SHA256 pin. No duplication, no drift.
-
-The IBKR TWS API archive ships BOTH:
-  * ``IBJts/source/proto/*.proto`` — schemas we compile
-  * ``IBJts/source/pythonclient/ibapi/client_utils.py`` — reference
-    encoder the parity audit walks against
-
-A single version pin keeps generated bindings and parity ground
-truth locked together.
+``scripts/twsapi.py``, and CI all consume one version + SHA256 pin.
+No duplication, no drift. From the IBKR TWS API archive only the
+``.proto`` schemas (``IBJts/source/proto/*.proto``) and the version
+marker are used.
 """
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,17 +39,6 @@ class TwsapiMeta:
         return self.cache_dir / "IBJts" / "source" / "proto"
 
     @property
-    def client_utils_path(self) -> Path:
-        return (
-            self.cache_dir
-            / "IBJts"
-            / "source"
-            / "pythonclient"
-            / "ibapi"
-            / "client_utils.py"
-        )
-
-    @property
     def version_file(self) -> Path:
         return self.cache_dir / "IBJts" / "API_VersionNum.txt"
 
@@ -75,3 +59,33 @@ def load() -> TwsapiMeta:
         cfg = tomllib.load(f)
     t = cfg["tool"]["ib_async"]["twsapi"]
     return TwsapiMeta(version=t["version"], archive_sha256=t["archive_sha256"])
+
+
+_SECTION = "[tool.ib_async.twsapi]"
+
+
+def save(meta: TwsapiMeta, pyproject: Path | None = None) -> None:
+    """Rewrite the pin in place, leaving every other byte of the file alone.
+
+    Only the ``version`` and ``archive_sha256`` keys inside
+    ``[tool.ib_async.twsapi]`` change, so the section's comments and the
+    rest of ``pyproject.toml`` survive a bump untouched.
+    """
+    pyproject = pyproject or PYPROJECT
+    text = pyproject.read_text()
+    start = text.index(_SECTION)
+    end = text.find("\n[", start + len(_SECTION))
+    end = len(text) if end == -1 else end
+
+    section = text[start:end]
+    for key, value in (
+        ("version", meta.version),
+        ("archive_sha256", meta.archive_sha256),
+    ):
+        section, count = re.subn(
+            rf'^{key} = "[^"]*"$', f'{key} = "{value}"', section, flags=re.MULTILINE
+        )
+        if count != 1:
+            raise ValueError(f"expected one {key!r} key in {_SECTION}, found {count}")
+
+    pyproject.write_text(text[:start] + section + text[end:])

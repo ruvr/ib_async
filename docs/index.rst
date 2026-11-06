@@ -6,10 +6,12 @@ Contents
 
    readme
    api
+   ordertypes
    notebooks
    recipes
    code
    changelog
+   migration/v3
    links
 
 .. include:: ../README.md

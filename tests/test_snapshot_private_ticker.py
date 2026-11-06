@@ -22,6 +22,8 @@ Streaming (``snapshot=False``) is unchanged: it still returns the shared
 pooled Ticker so one object reflects every live tick stream.
 """
 
+from __future__ import annotations
+
 from unittest.mock import MagicMock
 
 import ib_async as ibi
@@ -285,7 +287,7 @@ async def test_reqTickersAsync_returns_private_clean_tickers():
     tickers = await ib.reqTickersAsync(*contracts)
 
     assert len(tickers) == 2
-    for c, t in zip(contracts, tickers):
+    for c, t in zip(contracts, tickers, strict=True):
         pooled = ib.wrapper.subscriptions.ticker_for_contract(c)
         assert t is not pooled  # private snapshot object
         assert t.isUnset(t.last)  # clean — no stale 1234.0 carried over

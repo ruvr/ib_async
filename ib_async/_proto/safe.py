@@ -14,23 +14,29 @@ value lands as ``None`` (the unset sentinel for our domain dataclass
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import MutableMapping, Sequence
 from decimal import Decimal, InvalidOperation
-from typing import Any, Final, TypeGuard
+from typing import TYPE_CHECKING, Final, TypeGuard, TypeVar
 
 from ..util import UNSET_DECIMAL, UNSET_DOUBLE, UNSET_INTEGER, UNSET_LONG
+
+if TYPE_CHECKING:
+    from ..contract import TagValue
 
 # Plain-scalar type annotation strings that survive ``from __future__ import
 # annotations``. Fields typed as ``int | None`` / ``Optional[int]`` etc are
 # intentionally left out — for those, ``None`` is the domain unset sentinel
-# and is meant to skip the wire emission. Plain ``int`` / ``float`` /
-# ``bool`` / ``str`` fields with a real default are coerced back to that
-# default if a caller stomped ``None`` onto the slot, mirroring the binary
-# path's ``_FORMAT_HANDLERS[type(None)] = lambda _: ""`` behavior at the
-# wire boundary (see ``Client._make_format_handlers``).
+# and is meant to skip the wire emission. If a caller sets ``None`` on a
+# plain ``int``, ``float``, ``bool`` or ``str`` field with a real default,
+# the field is set back to that default. The binary path does the
+# equivalent: ``Client._formatField`` writes None as "" when it formats
+# the message.
 _PLAIN_SCALAR_TYPES: Final[frozenset[str]] = frozenset({"int", "float", "bool", "str"})
 
+T = TypeVar("T")
 
-def normalize_none_scalars(obj: Any) -> Any:
+
+def normalize_none_scalars(obj: T) -> T:
     """Coerce ``None`` on plain-scalar dataclass fields back to the field's
     default value. Mutates and returns ``obj`` so callers can chain it on
     converter entry — the proto path's analog of the binary path's
@@ -38,9 +44,9 @@ def normalize_none_scalars(obj: Any) -> Any:
     field's wire-default (typically ``0`` for plain ``int`` fields like
     ``parentId``, ``ocaType``, ``triggerMethod``).
 
-    Without this normalization, a caller (e.g. icli's whatIf-preview path
-    which stamps ``parentId = None`` to suppress the parent link)
-    produces a wire frame missing the field entirely; TWS reads
+    Without this normalization, a caller that sets ``parentId = None``
+    (to send no parent link) produces a wire frame missing the field
+    entirely; TWS reads
     proto3-absent as its own ``UNSET_INTEGER = 2147483647`` sentinel and
     rejects the request with ``Error 135: Can't find order with id =
     2147483647``. The binary path always emits ``""`` for None and the
@@ -65,11 +71,10 @@ def normalize_none_scalars(obj: Any) -> Any:
     return obj
 
 
-# IBKR's reference ``decode(Decimal, fields)`` (utils.py) treats these
-# wire strings as the "unset Decimal" sentinel: max int32, max int64,
-# max double in upper-case-E scientific form, and the most-negative
-# int64. Any of these arriving as the wire string for a Decimal field
-# means "no value" — the caller's domain ``Decimal | None`` should
+# These wire strings are IBKR's "unset Decimal" sentinel: max int32,
+# max int64, max double (in each spelling it arrives in), and the
+# most-negative int64. Any of these arriving as the wire string for a
+# Decimal field means "no value" — the caller's domain ``Decimal | None`` should
 # stay ``None`` instead of carrying a 2.1 billion or 1.8e308 fake
 # quantity that would corrupt every downstream calculation.
 _DECIMAL_UNSET_STRINGS: Final[frozenset[str]] = frozenset(
@@ -87,8 +92,7 @@ _DECIMAL_UNSET_STRINGS: Final[frozenset[str]] = frozenset(
 def is_valid_int(value: int | None) -> TypeGuard[int]:
     """Returns True when ``value`` should be written to the proto wire.
 
-    Mirrors IBKR's ``isValidIntValue`` (``client_utils.py``): ``None``
-    (our domain unset sentinel) and the IBKR magic ``UNSET_INTEGER``
+    ``None`` (our domain unset sentinel) and the IBKR magic ``UNSET_INTEGER``
     wire value both come back False, so the proto3-optional field stays
     absent on the wire and the server's default fill behaves correctly.
     """
@@ -134,28 +138,22 @@ def format_proto_double(value: float) -> str:
     return f"{value:.8f}".rstrip("0").rstrip(".")
 
 
-def fill_tag_value_map(items: object, target: object) -> None:
+def fill_tag_value_map(
+    items: Sequence[TagValue] | None, target: MutableMapping[str, str]
+) -> None:
     """Copy a domain ``list[TagValue]`` into a proto ``map<string,string>``.
 
-    Mirrors IBKR's ``client_utils.fillTagValueList`` — empty / ``None``
-    inputs leave the proto map field unset on the wire (matching the
-    binary path's "skip the options block when the list is empty"
-    behaviour). Each ``TagValue`` is unpacked positionally so any
-    ``NamedTuple`` / dataclass / 2-tuple shape works.
-
-    Both args are typed ``object`` because the protobuf generated stubs
-    expose maps as ``ScalarMap[str, str]`` from a private name we can't
-    import, and the input is a domain list whose element type lives in
-    ``contract`` (importing it here would cycle).
+    The target is the map field of the parent proto. An empty or ``None``
+    input leaves the map field unset on the wire. The binary path also
+    skips the options block when the list is empty.
     """
     if not items:
         return
-    for tv in items:  # type: ignore[attr-defined]
-        tag, value = tv  # NamedTuple / sequence unpack
-        target[tag] = value  # type: ignore[index]
+    for tv in items:
+        target[tv.tag] = tv.value
 
 
-def safe_decimal(value: str | Decimal | float | int | None) -> Decimal | None:
+def safe_decimal(value: str | Decimal | float | None) -> Decimal | None:
     """Convert any wire-typed numeric to a domain ``Decimal | None``.
 
     Accepts protobuf ``string`` (the IBKR-canonical encoding for
@@ -188,8 +186,6 @@ def safe_decimal(value: str | Decimal | float | int | None) -> Decimal | None:
         # ``double`` paths; checking after str() would miss it because
         # ``str(sys.float_info.max)`` does not match the canonical
         # sentinel spelling on every Python build.
-        from ..util import UNSET_DOUBLE
-
         if value == UNSET_DOUBLE:
             return None
         value = str(value)
@@ -210,8 +206,8 @@ def wire_size_to_float(s: str) -> float:
     garbage land as ``0.0`` instead of raising. The wrapper's
     ``size == 0`` checks are semantically equivalent to "size is unset"
     on the binary path, so dropping unparseable values to zero matches
-    that behaviour exactly. Used by tick / market-depth / historical-
-    tick converters pending the Ticker hot-path Decimal benchmark.
+    that behaviour exactly. Used by the tick, market-depth and
+    historical-tick converters, whose wrapper methods take floats.
     """
     d = safe_decimal(s)
     return float(d) if d is not None else 0.0

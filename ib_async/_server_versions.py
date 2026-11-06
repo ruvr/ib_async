@@ -8,9 +8,8 @@ likewise gate conditional reads. Mismatched gates produce malformed
 wire frames the server can't parse OR mis-decoded responses where we
 read fields the server never sent.
 
-This module mirrors ``ibapi/server_versions.py`` from IBKR's official
-Python reference client. Update by re-syncing against that file
-when bumping ``MAX_CLIENT_VER``.
+This module holds IBKR's server version numbers, which must match the
+protocol IBKR publishes. Update them when bumping ``MAX_CLIENT_VER``.
 
 Constants below the protobuf cutoff (201) are kept too even though our
 modern client only negotiates >= MIN_CLIENT_VER. They're available for
@@ -24,7 +23,6 @@ from typing import Final
 
 # --- Pre-100 (legacy, listed for completeness; we never negotiate below 100)
 MIN_SERVER_VER_PTA_ORDERS: Final = 39
-MIN_SERVER_VER_FUNDAMENTAL_DATA: Final = 40
 MIN_SERVER_VER_DELTA_NEUTRAL: Final = 40
 MIN_SERVER_VER_CONTRACT_DATA_CHAIN: Final = 40
 MIN_SERVER_VER_SCALE_ORDERS2: Final = 40
@@ -185,6 +183,9 @@ MIN_SERVER_VER_FRACTIONAL_LAST_SIZE: Final = 222
 MIN_SERVER_VER_HEDGE_MAX_SIZE: Final = 223
 MIN_SERVER_VER_USE_PRECISION_FROM_SEC_DEF: Final = 224
 MIN_SERVER_VER_ODD_LOT_BID_ASK_QUOTES: Final = 225
+# IBKR switched gate naming from MIN_SERVER_VER_* to UNIFIED_VERSION_*
+# here; the name keeps IBKR's spelling so the two stay greppable.
+UNIFIED_VERSION_COND_ORDER_WITH_OVERNIGHT_PARAM: Final = 226
 
 # --- Client-side handshake bounds
 # MIN_CLIENT_VER below 100 used the pre-enhanced-handshake path (no length
@@ -194,4 +195,4 @@ MIN_CLIENT_VER: Final = 100
 # audited and patched for. Bumping this ALSO requires patches to every
 # conditional read/write at the new gate — see ``client.py`` and
 # ``decoder.py``. Do not bump without sequencing those fixes.
-MAX_CLIENT_VER: Final = MIN_SERVER_VER_ODD_LOT_BID_ASK_QUOTES
+MAX_CLIENT_VER: Final = UNIFIED_VERSION_COND_ORDER_WITH_OVERNIGHT_PARAM

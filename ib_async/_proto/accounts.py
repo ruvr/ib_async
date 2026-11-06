@@ -208,7 +208,7 @@ def createAccountSummaryArgs(
 def createAccountSummaryRequestProto(
     reqId: int, group: str, tags: str
 ) -> AccountSummaryRequest_pb2.AccountSummaryRequest:
-    # Mirror IBKR's ``client_utils.createAccountSummaryRequestProto``:
+    # As IBKR's server expects:
     # every field is gated on a non-empty / valid-int check. Proto3
     # explicit-optional semantics treat an explicit empty-string
     # assignment as "present-but-empty" (HasField returns True), which
@@ -266,7 +266,7 @@ def createAccountUpdateMultiArgs(
 def createAccountUpdatesMultiRequestProto(
     reqId: int, account: str, modelCode: str, ledgerAndNLV: bool
 ) -> AccountUpdatesMultiRequest_pb2.AccountUpdatesMultiRequest:
-    # Mirror IBKR's ``client_utils.createAccountUpdatesMultiRequestProto``:
+    # As IBKR's server expects:
     # each field is gated. Writing an explicit empty ``modelCode`` over
     # this path produced ``Error 321: Model name '' is incorrect`` from
     # TWS gateway 214; the gate below skips the write so the proto field
@@ -300,7 +300,7 @@ def createCancelAccountUpdatesMultiProto(
 def createAccountDataRequestProto(
     subscribe: bool, acctCode: str
 ) -> AccountDataRequest_pb2.AccountDataRequest:
-    # Mirror IBKR's ``client_utils.createAccountDataRequestProto`` —
+    # As IBKR's server expects,
     # both fields are gated. Writing an explicit empty ``acctCode``
     # over proto3 explicit-optional semantics presents the field as
     # set-but-empty to TWS.
@@ -388,7 +388,7 @@ def createPositionMultiArgs(
 def createPositionsMultiRequestProto(
     reqId: int, account: str, modelCode: str
 ) -> PositionsMultiRequest_pb2.PositionsMultiRequest:
-    # Mirror IBKR's ``client_utils.createPositionsMultiRequestProto`` —
+    # As IBKR's server expects,
     # each field is gated. Empty modelCode must NOT be written to the
     # wire (same model-name rejection as accountUpdatesMulti).
     proto = PositionsMultiRequest_pb2.PositionsMultiRequest()

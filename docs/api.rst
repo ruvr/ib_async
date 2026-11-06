@@ -39,12 +39,26 @@ Ticker
 
 .. automodule:: ib_async.ticker
 
+Data request values
+-------------------
+
+.. automodule:: ib_async.datarequests
+   :members: checkDuration
+
+.. automodule:: ib_async.datarequests.generated
+
 Objects
 -------
 
 .. automodule:: ib_async.objects
 
 .. autoclass:: ib_async.wrapper.RequestError
+
+Runtime state
+-------------
+
+.. automodule:: ib_async.runtime
+   :exclude-members: Tally
 
 Utilities
 ---------

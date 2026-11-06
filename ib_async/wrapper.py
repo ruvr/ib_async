@@ -1,5 +1,7 @@
 """Wrapper to handle incoming messages."""
 
+from __future__ import annotations
+
 import asyncio
 import dataclasses
 import logging
@@ -7,9 +9,10 @@ import time
 from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import date as date_
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Final, TypeAlias, cast
+from typing import TYPE_CHECKING, Final, Generic, TypeAlias, overload
 from zoneinfo import ZoneInfo
 
 from ib_async._requests import (
@@ -18,6 +21,7 @@ from ib_async._requests import (
     RequestRegistry,
     SingletonKey,
     WhatIfKey,
+    refusedAsNone,
 )
 from ib_async._subscriptions import (
     HistoricalBarsSub,
@@ -35,18 +39,19 @@ from ib_async.contract import (
     DeltaNeutralContract,
     ScanData,
 )
+from ib_async.depth import DepthOperation
 from ib_async.objects import (
     AccountValue,
     BarData,
+    BarDataList,
     CommissionReport,
     DepthMktDataDescription,
     Dividends,
-    DOMLevel,
     EfpData,
+    EmptyT,
     Execution,
     FamilyCode,
     Fill,
-    FundamentalRatios,
     HistogramData,
     HistoricalNews,
     HistoricalSchedule,
@@ -78,18 +83,22 @@ from ib_async.objects import (
     TradeLogEntry,
 )
 from ib_async.order import Order, OrderState, OrderStatus, Trade
+from ib_async.runtime import Tally
 from ib_async.ticker import HaltedStatus, Ticker
 from ib_async.util import (
     UNSET_DOUBLE,
     UNSET_INTEGER,
     dataclassAsDict,
-    dataclassUpdate,
     getLoop,
     globalErrorEvent,
+    isIBShortDatetime,
     parseIBDatetime,
+    parseIBShortDatetimes,
 )
 
 if TYPE_CHECKING:
+    from ib_async._pb.ConfigResponse_pb2 import ConfigResponse
+    from ib_async._pb.UpdateConfigResponse_pb2 import UpdateConfigResponse
     from ib_async.ib import IB
 
 
@@ -257,6 +266,14 @@ class RequestError(Exception):
         self.message = message
 
 
+# An error that names an order is handled in one of three ways. IBKR's error
+# callback does not say what happened to the order, so these lists do.
+#
+# 1. The order is still live, whatever it was doing (_WARNING_CODES).
+# 2. The code ends the order, unless the order was modified after TWS
+#    acknowledged it (_ENDS_UNMODIFIED_ORDER_CODES).
+# 3. Any other error ends the order, including 202 (Order cancelled).
+
 # Warnings are currently:
 # 105 - Order being modified does not match the original order. (?)
 # 110 - The price does not conform to the minimum price variation for this contract.
@@ -275,6 +292,35 @@ class RequestError(Exception):
 # Previously this was included as a Warning condition, but 202 is literally "Order Canceled" error status, so now it is an order-delete error:
 # 202 - Order cancelled - Reason:
 
+# Errors that end an order, except one modified after TWS acknowledged it
+# (``Trade.modifyUnconfirmed``). A refused modification leaves the order
+# working on its old terms and no status follows. TWS does not confirm a
+# modification, so a later error of this kind on a modified order also leaves
+# it live until TWS reports a status that ends it. Texts are from
+# https://interactivebrokers.github.io/tws-api/message_codes.html
+#
+# Reported on a modification:
+#   201   Order rejected - reason: (an invalid stop price; the order stayed
+#         live for the session)
+#   439   Order processing failed. Algorithm definition not found. (the order
+#         stayed live until cancelled)
+# IBKR's text says a change to an order failed:
+#   104   Can't modify a filled order. (its Filled status ends it)
+#   134   Modify order failed.
+#   422   The account and clearing attributes on this order may not be changed.
+#   440   Order modify failed. Algorithm cannot be modified.
+#   444   Volatility Combo order is not yet acknowledged. Cannot submit changes at this time.
+#   10241 Order Quantity is expressed in monetary terms. Modification is not supported via API.
+#   10242 Fractional-sized order cannot be modified via API.
+# These check the same fields as 439. No report of them on a modification is
+# known:
+#   441   Algo attributes validation failed:
+#   442   Specified algorithm is not allowed for this order.
+#   443   Order processing failed. Unknown algo attribute.
+_ENDS_UNMODIFIED_ORDER_CODES: Final[frozenset[int]] = frozenset(
+    {104, 134, 201, 422, 439, 440, 441, 442, 443, 444, 10241, 10242}
+)
+
 # Connection-state notifications (TWS "system messages" with reqId=-1):
 #   1100 - "Connectivity between IB and TWS has been lost."
 #   1101 - "Connectivity between IB and TWS has been restored - data lost."
@@ -286,9 +332,48 @@ class RequestError(Exception):
 # informational nature; the wire path still emits ``errorEvent`` for any
 # subscriber that wants the raw stream. 1300 ("TWS socket port has been
 # reset") stays an error because the connection is actually torn down.
+# 10090 and 10091: part of the requested market data is not subscribed.
+# IBKR still sends the rest, and a snapshot still ends with
+# tickSnapshotEnd.
 _WARNING_CODES: Final[frozenset[int]] = frozenset(
-    {105, 110, 165, 321, 329, 399, 404, 434, 492, 1100, 1101, 1102, 10167, 10349}
+    {
+        105,
+        110,
+        165,
+        321,
+        329,
+        399,
+        404,
+        434,
+        492,
+        1100,
+        1101,
+        1102,
+        10090,
+        10091,
+        10167,
+        10349,
+    }
 )
+
+# Errors after which IBKR does not serve a stream (market data, tick by
+# tick, depth, bars, scanner, PnL): the request has to change and be sent
+# again. From https://interactivebrokers.github.io/tws-api/message_codes.html
+# and IBKR's resolution page for 10089:
+#   101   max number of tickers reached
+#   200   no security definition for the request
+#   309   max number of market depth requests reached
+#   316   market depth HALTED, re-subscribe
+#   354   not subscribed to the requested market data
+#   10089 requires an additional market data subscription
+#   10186 not subscribed, and delayed data not enabled
+# Not here, because the stream goes on or IBKR does not say it ended: 102
+# (the live request with that id continues), 322, 10197 (competing live
+# session), and the warnings above (10090, 10091, 10167).
+STREAM_ENDING_CODES: Final[frozenset[int]] = frozenset(
+    {101, 200, 309, 316, 354, 10089, 10186}
+)
+
 
 # Cap on the size of ``_pendingCommissionReports``. A commissionReport
 # whose execId never gets a paired execDetails on this client (e.g.
@@ -334,15 +419,20 @@ MUTABLE_ORDER_FIELDS: Final[tuple[str, ...]] = (
     "adjustedStopLimitPrice",
     "adjustedTrailingAmount",
     "adjustableTrailingUnit",
+    # Parked / live state: an order can be deactivated or re-transmitted
+    # from TWS or Client Portal, not just the API. A stale copy here
+    # would ride along on the next modify via ``placeOrder(trade.order)``
+    # and silently transmit a parked order, or park a live one.
+    "deactivate",
 )
 
 
 @dataclass
-class Wrapper:
+class Wrapper(Generic[EmptyT]):
     """Wrapper implementation for use with the IB class."""
 
     # reference back to IB so wrapper can access API methods
-    ib: "IB"
+    ib: IB[EmptyT]
 
     accountValues: dict[tuple[str, str, str, str], AccountValue] = field(init=False)
     """ (account, tag, currency, modelCode) -> AccountValue """
@@ -377,14 +467,14 @@ class Wrapper:
     # cross-client / orphan reports never paired by an execDetails on
     # this client cannot grow this dict without limit. Cleared on reset
     # alongside ``fills``.
-    _pendingCommissionReports: "OrderedDict[str, CommissionReport]" = field(init=False)
+    _pendingCommissionReports: OrderedDict[str, CommissionReport] = field(init=False)
 
     newsTicks: list[NewsTick] = field(init=False)
 
     msgId2NewsBulletin: dict[int, NewsBulletin] = field(init=False)
     """ msgId -> NewsBulletin """
 
-    pendingTickers: set[Ticker] = field(init=False)
+    pendingTickers: set[Ticker[EmptyT]] = field(init=False)
 
     lastTime: datetime = field(init=False)
     """ UTC time of last network packet arrival. """
@@ -410,7 +500,7 @@ class Wrapper:
     request's future, accumulator container, and originating contract.
     See :mod:`ib_async._requests`."""
 
-    subscriptions: SubscriptionRegistry = field(init=False)
+    subscriptions: SubscriptionRegistry[EmptyT] = field(init=False)
     """Source of truth for live data subscriptions: mktData, tickByTick,
     mktDepth, real-time bars, historical bars with keepUpToDate, scanner,
     PnL. See :mod:`ib_async._subscriptions`."""
@@ -421,7 +511,11 @@ class Wrapper:
     _timeoutHandle: asyncio.TimerHandle | None = None
 
     # value used when a field has missing, empty, or not populated data
-    defaults: IBDefaults = field(default_factory=IBDefaults)
+    defaults: IBDefaults[EmptyT] = field(default_factory=IBDefaults)
+
+    # The session's counters (ib_async.runtime). reset() keeps them: each
+    # new registry shares them, and the client counts into them too.
+    tally: Tally = field(default_factory=Tally, init=False, repr=False)
 
     def __post_init__(self):
         # extract values from defaults objects just to use locally
@@ -451,8 +545,8 @@ class Wrapper:
         self._wshMetaReqId = 0
         self._wshEventReqId = 0
         self._timeout = 0
-        self.requests = RequestRegistry()
-        self.subscriptions = SubscriptionRegistry(self)
+        self.requests = RequestRegistry(tally=self.tally)
+        self.subscriptions = SubscriptionRegistry(self, tally=self.tally)
         # Cache the bound method on the hot per-tick path so each tick
         # handler does ``self._get_ticker(reqId)`` (one C-level dict.get
         # via the bound-method's __self__) instead of
@@ -493,22 +587,14 @@ class Wrapper:
 
         error = ConnectionError("Socket disconnect")
 
-        # Snapshot Tickers are private (not in the pool), so gather them
-        # from their still-live subscriptions before close_all drops the
-        # reqId index — otherwise an awaiter on a snapshot Ticker's
-        # ``updateEvent`` would never wake after a mid-snapshot disconnect.
-        snapshot_tickers = [
-            sub.ticker
-            for sub in self.subscriptions
-            if isinstance(sub, MktDataSub) and sub.snapshot and sub.ticker is not None
-        ]
-
+        self.tally.disconnects += 1
         self.requests.fail_all(error)
+        # Closing a snapshot subscription sets its own Ticker done. Pooled
+        # Tickers, which streams share, are set done below.
+        self.tally.subscriptionsDisconnected += len(self.subscriptions)
         self.subscriptions.close_all(send_cancel=False)
 
         for ticker in self.subscriptions.pooled_tickers():
-            ticker.updateEvent.set_done()
-        for ticker in snapshot_tickers:
             ticker.updateEvent.set_done()
 
         now = datetime.now(self.defaultTimezone)
@@ -538,8 +624,15 @@ class Wrapper:
         globalErrorEvent.emit(error)
         self.reset()
 
-    def _normalizeDatetime(self, value: datetime | Any) -> datetime | Any:
-        """Convert datetime values to the configured default timezone."""
+    @overload
+    def _normalizeDatetime(self, value: datetime) -> datetime: ...
+
+    @overload
+    def _normalizeDatetime(self, value: date_) -> date_: ...
+
+    def _normalizeDatetime(self, value: datetime | date_) -> datetime | date_:
+        """Convert a datetime to the configured default time zone. A date
+        has no time zone, so it is returned unchanged."""
         if not isinstance(value, datetime):
             return value
 
@@ -578,13 +671,8 @@ class Wrapper:
         return Contract.recreate(contract) if contract else None
 
     def orderKey(self, clientId: int, orderId: int, permId: int) -> OrderKeyType:
-        key: OrderKeyType
-        if orderId <= 0:
-            # order is placed manually from TWS
-            key = permId
-        else:
-            key = (clientId, orderId)
-        return key
+        # an order placed manually from TWS has no API orderId
+        return permId if orderId <= 0 else (clientId, orderId)
 
     def setTimeout(self, timeout: float):
         self.lastTime = datetime.now(self.defaultTimezone)
@@ -617,7 +705,7 @@ class Wrapper:
 
     # Helper methods for tick processing
 
-    def _processTimestampTick(self, ticker: Ticker, fieldName: str, value: str):
+    def _processTimestampTick(self, ticker: Ticker[EmptyT], fieldName: str, value: str):
         """Convert timestamp string to datetime and set on ticker field."""
         timestamp = int(value)
         # Only populate if timestamp isn't '0' (we don't want to report "last trade: 20,000 days ago")
@@ -629,7 +717,7 @@ class Wrapper:
             )
 
     def _processRtVolumeTick(
-        self, ticker: Ticker, tickType: int, value: str
+        self, ticker: Ticker[EmptyT], tickType: int, value: str
     ) -> tuple[float, float] | None:
         """
         Parse RT Volume or RT Trade Volume tick.
@@ -641,23 +729,24 @@ class Wrapper:
         """
         priceStr, sizeStr, rtTime, volume, vwap, _ = value.split(";")
 
-        if volume:
-            # Set volume field based on tick type
-            volumeField = RT_VOLUME_TICK_MAP[tickType]
-            setattr(ticker, volumeField, float(volume))
+        # Parse all fields before assigning any of them to the ticker.
+        # A malformed string then leaves the ticker unchanged.
+        totalVolume = float(volume) if volume else None
+        vwapValue = float(vwap) if vwap else None
+        tradeTime = (
+            datetime.fromtimestamp(int(rtTime) / 1000, self.defaultTimezone)
+            if rtTime
+            else None
+        )
+        trade = None if priceStr == "" else (float(priceStr), float(sizeStr))
 
-        if vwap:
-            ticker.vwap = float(vwap)
-
-        if rtTime:
-            ticker.rtTime = datetime.fromtimestamp(
-                int(rtTime) / 1000, self.defaultTimezone
-            )
-
-        if priceStr == "":
-            return None
-
-        return (float(priceStr), float(sizeStr))
+        if totalVolume is not None:
+            setattr(ticker, RT_VOLUME_TICK_MAP[tickType], totalVolume)
+        if vwapValue is not None:
+            ticker.vwap = vwapValue
+        if tradeTime is not None:
+            ticker.rtTime = tradeTime
+        return trade
 
     # wrapper methods
 
@@ -795,24 +884,17 @@ class Wrapper:
         pos: Decimal | None,
         avgCost: Decimal | None,
     ):
-        # ``Client.reqPositionsMulti`` is exposed for advisor accounts.
-        # Surface every row on ``positionEvent`` (same shape as the
-        # ``position`` callback) and accumulate against the request key
-        # so any future ``reqPositionsMultiAsync`` can drain it. Drop
-        # zero / unset positions the same way ``position`` does.
-        contract = Contract.recreate(contract)
-        position = Position(account, contract, pos, avgCost)
-        if not pos:
-            self.positions[account].pop(contract.conId, None)
-        else:
-            self.positions[account][contract.conId] = position
-        self.requests.append(ReqIdKey(reqId), position)
-        self.ib.positionEvent.emit(position)
+        # The rows of IB.reqPositionsMulti, collected for its request. They
+        # stay out of the account-wide ``positions``: a row filtered by
+        # model is that model's share, not the account's position.
+        # Zero positions are left out, as ``positions()`` leaves them out.
+        if pos:
+            position = Position(
+                account, Contract.recreate(contract), pos, avgCost, modelCode
+            )
+            self.requests.append(ReqIdKey(reqId), position)
 
     def positionMultiEnd(self, reqId: int):
-        # Mirrors ``accountUpdateMultiEnd``: settle the request future
-        # so any future async waiter resolves. No-op when no waiter
-        # is registered for this reqId.
         self.requests.set_result(ReqIdKey(reqId))
 
     def pnl(
@@ -862,8 +944,11 @@ class Wrapper:
         * handle openOrders and allOpenOrders responses.
         """
         if order.whatIf:
-            # response to whatIfOrder
-            if float(orderState.initMarginChange) != UNSET_DOUBLE:
+            # Response to whatIfOrder. TWS sends a first reply without
+            # margins, where the margin is empty or the unset double. A
+            # second reply carries the margins.
+            margin = orderState.initMarginChange
+            if margin and float(margin) != UNSET_DOUBLE:
                 self.requests.set_result(WhatIfKey(order.orderId), orderState)
         else:
             key = self.orderKey(order.clientId, order.orderId, order.permId)
@@ -872,9 +957,10 @@ class Wrapper:
             # stripped. Stored on the trade as `serverOrder` so callers
             # can read fields that the MUTABLE_ORDER_FIELDS allowlist
             # does not yet propagate into ``trade.order``.
-            serverOrderSnapshot = Order(
-                **{k: v for k, v in dataclassAsDict(order).items() if v != "?"}
-            )
+            serverOrderSnapshot = dataclasses.replace(order)
+            for orderField in dataclasses.fields(serverOrderSnapshot):
+                if getattr(serverOrderSnapshot, orderField.name) == "?":
+                    setattr(serverOrderSnapshot, orderField.name, orderField.default)
             if trade:
                 for fieldName in MUTABLE_ORDER_FIELDS:
                     setattr(trade.order, fieldName, getattr(order, fieldName))
@@ -901,11 +987,10 @@ class Wrapper:
                 self._logger.info("openOrder: %s", trade)
 
             self.permId2Trade.setdefault(order.permId, trade)
-            # If a reqOpenOrdersAsync / reqAllOpenOrdersAsync is currently
-            # collecting, accumulate the snapshot; otherwise this is a
-            # live order update arriving outside any pending request and
-            # should fire the live event instead.
-            if SingletonKey("openOrders") in self.requests:
+            # An open orders request's answer, collected (or dropped, once
+            # its caller gave up on it); otherwise this is a live order
+            # update arriving outside any request and fires the live event.
+            if self.requests.answering(SingletonKey("openOrders")):
                 self.requests.append(SingletonKey("openOrders"), trade)
             else:
                 self.ib.openOrderEvent.emit(trade)
@@ -923,8 +1008,9 @@ class Wrapper:
         # records for completed orders; ``status`` may be unset on this
         # path. Fall back to ``status`` to remain backwards-compatible
         # with older servers / decoders that only fill the latter.
-        terminalStatus = orderState.completedStatus or orderState.status
-        if terminalStatus not in OrderStatus.DoneStates:
+        rawStatus = orderState.completedStatus or orderState.status
+        terminalStatus = OrderStatus.terminalFromCompleted(rawStatus)
+        if terminalStatus is None:
             # The completed-orders channel is terminal BY DEFINITION. An
             # unset or unrecognized status string must never let this trade
             # masquerade as an open working order in openTrades()/openOrders()
@@ -935,14 +1021,12 @@ class Wrapper:
                 "completedOrder: permId=%s reported non-terminal status %r; "
                 "classifying Inactive",
                 order.permId,
-                terminalStatus,
+                rawStatus,
             )
-            rawStatus = terminalStatus
-            statusNormalized = True
             terminalStatus = OrderStatus.Inactive
-        else:
-            rawStatus = ""
-            statusNormalized = False
+        # Any rewrite — a recognised TWS phrasing or the Inactive fallback —
+        # keeps the original text in the trade log.
+        statusNormalized = terminalStatus != rawStatus
         existing = self.permId2Trade.get(order.permId)
         if existing is not None:
             # An ``openOrder`` snapshot for this permId already wired up
@@ -1005,23 +1089,25 @@ class Wrapper:
         if trade:
             msg: str | None
             oldStatus = trade.orderStatus.status
-            new = dict(
-                status=status,
-                filled=filled,
-                remaining=remaining,
-                avgFillPrice=avgFillPrice,
-                permId=permId,
-                parentId=parentId,
-                lastFillPrice=lastFillPrice,
-                clientId=clientId,
-                whyHeld=whyHeld,
-                mktCapPrice=mktCapPrice,
-            )
+            new = {
+                "status": status,
+                "filled": filled,
+                "remaining": remaining,
+                "avgFillPrice": avgFillPrice,
+                "permId": permId,
+                "parentId": parentId,
+                "lastFillPrice": lastFillPrice,
+                "clientId": clientId,
+                "whyHeld": whyHeld,
+                "mktCapPrice": mktCapPrice,
+            }
             curr = dataclassAsDict(trade.orderStatus)
             isChanged = curr != {**curr, **new}
 
             if isChanged:
-                dataclassUpdate(trade.orderStatus, **new)
+                # the trade's live status, changed in place
+                for name, value in new.items():
+                    setattr(trade.orderStatus, name, value)
                 msg = ""
             elif (
                 status == "Submitted"
@@ -1042,7 +1128,12 @@ class Wrapper:
                 if status != oldStatus:
                     if status == OrderStatus.Filled:
                         trade.filledEvent.emit(trade)
-                    elif status == OrderStatus.Cancelled:
+                    elif status == OrderStatus.Cancelled or (
+                        # the event the held error would have fired
+                        status == OrderStatus.Inactive
+                        and oldStatus == OrderStatus.ValidationError
+                        and trade.modifyUnconfirmed
+                    ):
                         trade.cancelledEvent.emit(trade)
         else:
             self._logger.error(
@@ -1061,19 +1152,23 @@ class Wrapper:
             # bug in TWS: executions of manual orders have unset value
             execution.orderId = 0
 
-        trade = self.permId2Trade.get(execution.permId)
-        if not trade:
-            key = self.orderKey(execution.clientId, execution.orderId, execution.permId)
-            trade = self.trades.get(key)
+        trade = self._tradeForExecution(execution)
 
-        # TODO: debug why spread contracts aren't fully detailed here. They have no legs in execDetails, but they do in orderStatus?
-        if trade and contract == trade.contract:
+        # A combo's execution contract has no legs (its order's has, and
+        # a bag the user built has conId 0): the trade, found by its
+        # order, says which bag it is.
+        if trade and (
+            contract == trade.contract
+            or contract.secType == trade.contract.secType == "BAG"
+        ):
             contract = trade.contract
         else:
             contract = Contract.recreate(contract)
 
         execId = execution.execId
-        isLive = ReqIdKey(reqId) not in self.requests
+        # A row of a reqExecutions answer (even one its caller gave up on)
+        # is history; any other execution is a live fill.
+        isLive = not self.requests.answering(ReqIdKey(reqId))
         time = self.lastTime if isLive else execution.time
         # If a commissionReport for this execId arrived ahead of the
         # fill (rare cross-client / startup-replay race), drain the
@@ -1118,20 +1213,33 @@ class Wrapper:
     def execDetailsEnd(self, reqId: int):
         self.requests.set_result(ReqIdKey(reqId))
 
+    def _tradeForExecution(self, execution: Execution) -> Trade | None:
+        """Find the trade that ``execution`` fills.
+
+        Looks it up by permId once an openOrder has reported one, otherwise
+        by client and order id, because a fill can arrive before any
+        openOrder for the order."""
+        trade = self.permId2Trade.get(execution.permId)
+        if not trade:
+            key = self.orderKey(execution.clientId, execution.orderId, execution.permId)
+            trade = self.trades.get(key)
+        return trade
+
     def commissionReport(self, commissionReport: CommissionReport):
         # ``commissionReport.yield_`` and ``realizedPNL`` are
-        # ``Decimal | None`` for v3.0 — ``None`` IS the unset sentinel
-        # so we don't substitute ``defaults.unset`` (which is
-        # ``float('nan')`` and would (a) violate the field type and
-        # (b) reintroduce the ``Decimal('NaN')`` truthy trap). Future
-        # IBDefaults plumbing for Decimal-typed fields lands as a
-        # separate piece of work — see the operator's IBDefaults.unset
-        # follow-up note.
+        # ``Decimal | None``; ``None`` is the unset value, so they are
+        # passed through as decoded rather than substituted.
         fill = self.fills.get(commissionReport.execId)
         if fill:
-            report = dataclassUpdate(fill.commissionReport, commissionReport)
+            # the fill's own report, completed in place (the fill is
+            # frozen, and already handed out)
+            report = fill.commissionReport
+            if report == commissionReport:
+                return  # repeated report, already applied
+            for f in dataclasses.fields(commissionReport):
+                setattr(report, f.name, getattr(commissionReport, f.name))
             self._logger.info("commissionReport: %s", report)
-            trade = self.permId2Trade.get(fill.execution.permId)
+            trade = self._tradeForExecution(fill.execution)
             if trade and commissionReport.execId in self._liveExecIds:
                 self.ib.commissionReportEvent.emit(trade, fill, report)
                 trade.commissionReportEvent.emit(trade, fill, report)
@@ -1156,13 +1264,12 @@ class Wrapper:
 
     def orderBound(self, permId: int, clientId: int, orderId: int):
         # IBKR's contract on this callback is ``(permId, clientId,
-        # orderId)`` (see ibapi/wrapper.py). Both the binary decoder
-        # (``decoder.py`` msgId 100) and the proto decoder
-        # (``_protoOrderBound``) call us with that argument order. The
-        # body stays a no-op — the wrapper has no domain-side bookkeeping
-        # tied to manual-order binding — but the signature matches the
-        # reference contract so subclasses overriding this method see
-        # the values under their documented names.
+        # orderId)``. Both the binary decoder (``decoder.py`` msgId 100)
+        # and the proto decoder (``_protoOrderBound``) call us with that
+        # argument order. The body stays a no-op — the wrapper has no
+        # domain-side bookkeeping tied to manual-order binding — but the
+        # signature follows that contract so subclasses overriding this
+        # method see the values under their documented names.
         pass
 
     def contractDetails(self, reqId: int, contractDetails: ContractDetails):
@@ -1211,13 +1318,96 @@ class Wrapper:
         bars.updateEvent.emit(bars, True)
 
     def historicalData(self, reqId: int, bar: BarData):
-        if ReqIdKey(reqId) not in self.requests:
+        key = ReqIdKey(reqId)
+        if key not in self.requests:
             return
-        bar.date = self._normalizeDatetime(parseIBDatetime(bar.date))  # type: ignore[arg-type]
-        self.requests.append(ReqIdKey(reqId), bar)
+
+        # ``formatDate=3`` omits the year (``MMdd HH:MM:SS <tz>``), so a
+        # bar cannot be dated on its own. Keep the wire string and date
+        # the whole ascending run in ``historicalDataEnd`` -- the first
+        # point where IB's response bounds are in hand on every
+        # transport: below server version 196 they ride in the bar frame
+        # itself, from 196 they arrive as their own frame, and the
+        # protobuf ``HistoricalData`` message carries only ``reqId`` plus
+        # bars with the bounds in ``HistoricalDataEnd``.
+        if not (isinstance(bar.date, str) and isIBShortDatetime(bar.date)):
+            bar.date = self._normalizeDatetime(parseIBDatetime(bar.date))  # type: ignore[arg-type]
+
+        self.requests.append(key, bar)
 
     def historicalDataEnd(self, reqId, _start: str, _end: str):
-        self.requests.set_result(ReqIdKey(reqId))
+        key = ReqIdKey(reqId)
+        req = self.requests.get(key)
+        if req is not None:
+            self._dateShortBars(req.container, _start, _end)
+
+        self.requests.set_result(key)
+
+    def _dateShortBars(
+        self, bars: list[BarData], startDateStr: str, endDateStr: str
+    ) -> None:
+        """Stamp years onto the ``formatDate=3`` bars held for a request.
+
+        The response bounds IB reports alongside the dataset are full
+        ``yyyymmdd`` timestamps even when the bars themselves are not, so
+        they anchor the run. When neither bound survives parsing the run
+        is anchored on the current time instead, which is right for every
+        request that ends at or near now and is still better than
+        dropping the whole dataset.
+        """
+        # ``formatDate`` is a per-request wire setting, so a dataset is
+        # either all short or none of it is: probing the first bar keeps
+        # every other format at O(1) here rather than re-walking a
+        # multi-thousand-bar series that was already dated on arrival.
+        if not bars or not isinstance(getattr(bars[0], "date", None), str):
+            return
+
+        pending = [
+            bar
+            for bar in bars
+            if isinstance(bar, BarData)
+            and isinstance(bar.date, str)
+            and isIBShortDatetime(bar.date)
+        ]
+        if not pending:
+            return
+
+        start = self._parseResponseBound(startDateStr)
+        end = self._parseResponseBound(endDateStr)
+        if start is None and end is None:
+            self._logger.warning(
+                "historicalData: formatDate=3 bars arrived without usable "
+                "response bounds; inferring the year from the current date"
+            )
+
+        dates = parseIBShortDatetimes(
+            [bar.date for bar in pending],  # type: ignore[misc]
+            start=start,
+            end=end,
+        )
+        for bar, date in zip(pending, dates, strict=True):
+            bar.date = self._normalizeDatetime(date)
+
+    @staticmethod
+    def _parseResponseBound(s: str) -> datetime | None:
+        """Parse a historical start/end bound, tolerating anything odd.
+
+        A bound that IB omits, truncates, or stamps with a timezone this
+        host doesn't know must not take the dataset down with it.
+        """
+        if not s:
+            return None
+
+        try:
+            parsed = parseIBDatetime(s)
+        except (ValueError, KeyError, OverflowError, OSError, TypeError):
+            # malformed text, unknown time zone, out-of-range epoch
+            return None
+
+        if isinstance(parsed, datetime):
+            return parsed
+
+        return datetime(parsed.year, parsed.month, parsed.day)
 
     def historicalDataUpdate(self, reqId: int, bar: BarData):
         sub = self.subscriptions.get_sub(reqId)
@@ -1227,8 +1417,25 @@ class Wrapper:
         if not bars:
             return
 
-        bar.date = self._normalizeDatetime(parseIBDatetime(bar.date))  # type: ignore[arg-type]
         lastDate = bars[-1].date
+        if isinstance(lastDate, str):
+            # The historical run this subscription extends is still
+            # awaiting ``historicalDataEnd`` to date its ``formatDate=3``
+            # bars, so there is nothing to order this update against yet.
+            return
+
+        if isinstance(bar.date, str) and isIBShortDatetime(bar.date):
+            # A live update carries no response bounds at all, but the
+            # bars already dated for this subscription do: an update sits
+            # on or just past the last one.
+            [date] = parseIBShortDatetimes(
+                [bar.date],
+                start=lastDate if isinstance(lastDate, datetime) else None,
+            )
+            bar.date = self._normalizeDatetime(date)
+        else:
+            bar.date = self._normalizeDatetime(parseIBDatetime(bar.date))  # type: ignore[arg-type]
+
         if bar.date < lastDate:
             return
 
@@ -1244,16 +1451,14 @@ class Wrapper:
         bars.updateEvent.emit(bars, hasNewBar)
 
     def headTimestamp(self, reqId: int, headTimestamp: str):
-        # ``parseIBDatetime`` raises ``ValueError`` for malformed wire strings
-        # and ``ZoneInfoNotFoundError`` (a subclass of ``KeyError``) for
-        # unrecognised timezone names. Catching only ``ValueError`` left an
-        # awaiter hanging when IBKR shipped a timezone the host doesn't know;
-        # we widen to ``Exception`` so any parse failure surfaces as the
-        # request error instead of silently dropping the frame.
+        # ``parseIBDatetime`` raises ``ValueError`` for any input it cannot
+        # parse, including an unknown timezone name. Any failure is reported
+        # as the request's error, so the frame is not silently dropped and
+        # the awaiter does not hang.
         try:
             dt = self._normalizeDatetime(parseIBDatetime(headTimestamp))
             self.requests.set_result(ReqIdKey(reqId), dt)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - delivered to the awaiter
             self.requests.set_error(ReqIdKey(reqId), exc)
 
     def historicalTicks(self, reqId: int, ticks: list[HistoricalTick], done: bool):
@@ -1303,6 +1508,11 @@ class Wrapper:
         if attrib is not None:
             ticker.tickAttrib = attrib
 
+        # The values the ticker shows: the wire's, or the empty values of
+        # ``defaults`` for a side IBKR reports as having no quote.
+        shownPrice: float | EmptyT = price
+        shownSize: float | EmptyT = size
+
         # Allow overwriting IBKR's default "empty price" of -1 when there is no qty/size on a side.
         # https://interactivebrokers.github.io/tws-api/tick_types.html
         if tickType in {1, 66}:
@@ -1312,35 +1522,31 @@ class Wrapper:
             # Bid/Ask updates always have a Price+Size delivered at the same time, while the
             # other properties are mainly price-only delivery methods.
             if size == 0:
-                price = self.defaultEmptyPrice
-                size = self.defaultEmptySize
+                shownPrice = self.defaultEmptyPrice
+                shownSize = self.defaultEmptySize
 
             ticker.prevBid = ticker.bid
             ticker.prevBidSize = ticker.bidSize
-            ticker.bid = price
-            ticker.bidSize = size
+            ticker.bid = shownPrice
+            ticker.bidSize = shownSize
         elif tickType in {2, 67}:
             if size == 0:
-                price = self.defaultEmptyPrice
-                size = self.defaultEmptySize
+                shownPrice = self.defaultEmptyPrice
+                shownSize = self.defaultEmptySize
 
             ticker.prevAsk = ticker.ask
             ticker.prevAskSize = ticker.askSize
-            ticker.ask = price
-            ticker.askSize = size
+            ticker.ask = shownPrice
+            ticker.askSize = shownSize
         elif tickType in {4, 68}:
             # for 'last' values, price can be valid with size=0 for updates like 'last SPX price' since SPX doesn't trade
             # Workaround: for TICK-NYSE, it is valid to have price=-1, size=0 because it can float between -10,000 and 10,000
             #             and it also never reports a size. As a workaround, check if ticker.close exists as a proxy for "not TICK-NYSE"
             #             because TICK-NYSE never has open/close values populated.
-            if (
-                price == -1
-                and size == 0
-                and ticker.close is not None
-                and ticker.close > 0
-            ):
-                price = self.defaultEmptyPrice
-                size = self.defaultEmptySize
+            close = ticker.close
+            if price == -1 and size == 0 and self.defaults.isPrice(close) and close > 0:
+                shownPrice = self.defaultEmptyPrice
+                shownSize = self.defaultEmptySize
 
             # BUG? IBKR is sometimes sending a GOOD VALUE followed by a PREVIOUS value all under tickType=4?
             # e.g. I get the SPX close delivered first with size=0, then I get another data point with size=1 priced one point lower,
@@ -1350,20 +1556,37 @@ class Wrapper:
 
             ticker.prevLast = ticker.last
             ticker.prevLastSize = ticker.lastSize
-            ticker.last = price
-            ticker.lastSize = size
+            ticker.last = shownPrice
+            ticker.lastSize = shownSize
         else:
-            assert tickType in PRICE_TICK_MAP, (
-                f"Received tick {tickType=} {price=} but we don't have an attribute mapping for it? Triggered from {ticker.contract=}"
-            )
+            if tickType not in PRICE_TICK_MAP:
+                # a tick type IBKR added after this release: skip it
+                self._logger.debug(
+                    "unmapped tickType %s (%r) for %s", tickType, price, ticker.contract
+                )
+                return
 
             setattr(ticker, PRICE_TICK_MAP[tickType], price)
 
-        if price or size:
-            tick = TickData(self.lastTime, tickType, price, size)
-            ticker.ticks.append(tick)
-
+        self._logTick(ticker, tickType, shownPrice, shownSize)
         self.pendingTickers.add(ticker)
+
+    def _logTick(
+        self,
+        ticker: Ticker[EmptyT],
+        tickType: int,
+        price: float | EmptyT | None,
+        size: float | EmptyT,
+    ) -> None:
+        """Append a tick to ``ticker.ticks`` if it carries a price or a size
+        other than 0. A tick with only empty values and zeros (a side
+        emptied, a size tick with no price and no size) is not logged,
+        whatever values ``defaults`` uses."""
+        defaults = self.defaults
+        if (defaults.isPrice(price) and price != 0) or (
+            defaults.isSize(size) and size != 0
+        ):
+            ticker.ticks.append(TickData(self.lastTime, tickType, price, size))
 
     def tickSize(self, reqId: int, tickType: int, size: float):
         ticker = self._get_ticker(reqId)
@@ -1372,7 +1595,9 @@ class Wrapper:
             self._logger.debug(f"tickSize: Unknown reqId: {reqId}")
             return
 
-        price = self.defaultEmptyPrice
+        # The price logged with the tick: the price of the tick's side, or
+        # an empty value when that side has none.
+        price: float | EmptyT | None = self.defaultEmptyPrice
 
         # https://interactivebrokers.github.io/tws-api/tick_types.html
         if tickType in {0, 69}:
@@ -1407,16 +1632,16 @@ class Wrapper:
                 ticker.prevLastSize = ticker.lastSize
                 ticker.lastSize = size
         else:
-            assert tickType in SIZE_TICK_MAP, (
-                f"Received tick {tickType=} {size=} but we don't have an attribute mapping for it? Triggered from {ticker.contract=}"
-            )
+            if tickType not in SIZE_TICK_MAP:
+                # a tick type IBKR added after this release: skip it
+                self._logger.debug(
+                    "unmapped tickType %s (%r) for %s", tickType, size, ticker.contract
+                )
+                return
 
             setattr(ticker, SIZE_TICK_MAP[tickType], size)
 
-        if price or size:
-            tick = TickData(self.lastTime, tickType, price, size)
-            ticker.ticks.append(tick)
-
+        self._logTick(ticker, tickType, price, size)
         self.pendingTickers.add(ticker)
 
     def tickSnapshotEnd(self, reqId: int):
@@ -1450,14 +1675,16 @@ class Wrapper:
             self._logger.debug(f"tickByTickAllLast: Unknown reqId: {reqId}")
             return
 
+        shownPrice: float | EmptyT = price
+        shownSize: float | EmptyT = size
         if price == -1 and size == 0:
-            price = self.defaultEmptyPrice
-            size = self.defaultEmptySize
+            shownPrice = self.defaultEmptyPrice
+            shownSize = self.defaultEmptySize
 
         ticker.prevLast = ticker.last
         ticker.prevLastSize = ticker.lastSize
-        ticker.last = price
-        ticker.lastSize = size
+        ticker.last = shownPrice
+        ticker.lastSize = shownSize
 
         # Wire-reported exchange tick time (epoch seconds) is authoritative;
         # ``self.lastTime`` is a local-clock fallback used only when the
@@ -1470,8 +1697,8 @@ class Wrapper:
         tick = TickByTickAllLast(
             tickType,
             tickTime,
-            price,
-            size,
+            shownPrice,
+            shownSize,
             tickAttribLast,
             exchange,
             specialConditions,
@@ -1551,16 +1778,6 @@ class Wrapper:
             elif tickType in TIMESTAMP_TICK_MAP:
                 # Timestamp conversion (O(1) dict lookup)
                 self._processTimestampTick(ticker, TIMESTAMP_TICK_MAP[tickType], value)
-            elif tickType == 47:
-                # https://web.archive.org/web/20200725010343/https://interactivebrokers.github.io/tws-api/fundamental_ratios_tags.html
-                d = dict(t.split("=") for t in value.split(";") if t)
-                for k, v in d.items():
-                    with suppress(ValueError):
-                        if v == "-99999.99":
-                            v = "nan"
-                        d[k] = float(v)  # type: ignore[assignment]
-                        d[k] = int(v)  # type: ignore[assignment]
-                ticker.fundamentalRatios = FundamentalRatios(**d)
             elif tickType in RT_VOLUME_TICK_MAP:
                 # RT Volume or RT Trade Volume (O(1) dict lookup + helper)
                 result = self._processRtVolumeTick(ticker, tickType, value)
@@ -1570,7 +1787,9 @@ class Wrapper:
                     ticker.prevLastSize = ticker.lastSize
                     ticker.last = price
                     ticker.lastSize = size
-                    tick = TickData(self.lastTime, tickType, price, size)
+                    tick: TickData[EmptyT] = TickData(
+                        self.lastTime, tickType, price, size
+                    )
                     ticker.ticks.append(tick)
             elif tickType == 59:
                 # Dividend tick:
@@ -1600,31 +1819,37 @@ class Wrapper:
             return
 
         try:
-            value = float(value)
-            # The "empty size" clamp normalizes IBKR's "no quote" sentinel
-            # (negative / zero values for sided book metrics) into the
-            # user-configured empty value. But certain tick types carry
-            # signed semantics or a -1 unset code that must survive — see
-            # ``_GENERIC_TICK_NO_CLAMP`` for the rationale.
-            if tickType not in _GENERIC_TICK_NO_CLAMP:
-                value = value if value > 0 else self.defaultEmptySize
+            number = float(value)
         except ValueError:
             self._logger.error(
                 f"[tickType {tickType}] genericTick: malformed value: {value!r}"
             )
             return
 
-        assert tickType in GENERIC_TICK_MAP, (
-            f"Received tick {tickType=} {value=} but we don't have an attribute mapping for it? Triggered from {ticker.contract=}"
-        )
+        # The "empty size" clamp normalizes IBKR's "no quote" sentinel
+        # (negative / zero values for sided book metrics) into the
+        # user-configured empty value. But certain tick types carry
+        # signed semantics or a -1 unset code that must survive — see
+        # ``_GENERIC_TICK_NO_CLAMP`` for the rationale.
+        shown: float | EmptyT = number
+        if tickType not in _GENERIC_TICK_NO_CLAMP and not number > 0:
+            shown = self.defaultEmptySize
 
+        if tickType not in GENERIC_TICK_MAP:
+            # a tick type IBKR added after this release: skip it
+            self._logger.debug(
+                "unmapped tickType %s (%r) for %s", tickType, value, ticker.contract
+            )
+            return
+
+        # The halted ticks are never clamped, so ``number`` is what they show.
         if tickType in _HALTED_TICKS:
             with suppress(ValueError):
-                value = HaltedStatus(int(value))
+                shown = HaltedStatus(int(number))
 
-        setattr(ticker, GENERIC_TICK_MAP[tickType], value)
+        setattr(ticker, GENERIC_TICK_MAP[tickType], shown)
 
-        tick = TickData(self.lastTime, tickType, value, 0)
+        tick = TickData(self.lastTime, tickType, shown, 0)
         ticker.ticks.append(tick)
         self.pendingTickers.add(ticker)
 
@@ -1677,44 +1902,12 @@ class Wrapper:
         if ticker is None:
             return
 
-        # 'dom' is a dict so we can address position updates directly
-        dom = ticker.domBidsDict if side else ticker.domAsksDict
-
-        # if you're curious when these operations run and what they do, enable this too:
-        # fmt: off
-        # print("BID" if side else "ASK", "OPERATION", operation, "at position", position, "for price", price, "at qty", size)
-        # assert list(dom.keys()) == list(range(0, len(dom))), f"Keys aren't sequential? {dom} :: {ticker}"
-        # fmt: on
-
-        if operation in {0, 1}:
-            # '0' is INSERT NEW
-            # '1' is UPDATE EXISTING
-            # We are using the same operation for "insert or overwrite" directly.
-            dom[position] = DOMLevel(price, size, marketMaker)
-        elif operation == 2:
-            # '2' is DELETE EXISTING
+        removed = ticker.dom.apply(side, operation, position, price, size, marketMaker)
+        if operation == DepthOperation.DELETE:
+            # A delete tick reports the removed row's price and no size.
             size = 0
-            try:
-                level = dom.pop(position)
-                price = level.price
-            except Exception as _:
-                # invalid position requested for removal, so ignore the request
-                pass
-
-        # To retain the original API structure, we convert all sorted dict
-        # values into lists for users to consume.
-        # Users can also read ticker.domBidsDict or ticker.domAsksDict directly.
-        values = list(dom.values())
-        if side:
-            # Update BID for users
-            ticker.domBids = values
-        else:
-            # Update ASK for users
-            ticker.domAsks = values
-
-        # TODO: add optional debugging check. In a correctly working system, we should
-        #       technically always have sequential bid and ask position entries, but
-        #       in the past we have seen gaps or missing values.
+            if removed is not None:
+                price = removed.price
 
         tick = MktDepthData(
             self.lastTime, position, marketMaker, operation, side, price, size
@@ -1727,14 +1920,14 @@ class Wrapper:
         reqId: int,
         tickType: int,
         tickAttrib: int,
-        impliedVol: float,
-        delta: float,
-        optPrice: float,
-        pvDividend: float,
-        gamma: float,
-        vega: float,
-        theta: float,
-        undPrice: float,
+        impliedVol: float | None,
+        delta: float | None,
+        optPrice: float | None,
+        pvDividend: float | None,
+        gamma: float | None,
+        vega: float | None,
+        theta: float | None,
+        undPrice: float | None,
     ):
         comp = OptionComputation(
             tickAttrib,
@@ -1752,9 +1945,15 @@ class Wrapper:
             # reply from reqMktData
             # https://interactivebrokers.github.io/tws-api/tick_types.html
 
-            assert tickType in GREEKS_TICK_MAP, (
-                f"Received tick {tickType=} {tickAttrib=} but we don't have an attribute mapping for it? Triggered from {ticker.contract=}"
-            )
+            if tickType not in GREEKS_TICK_MAP:
+                # a tick type IBKR added after this release: skip it
+                self._logger.debug(
+                    "unmapped tickType %s (%r) for %s",
+                    tickType,
+                    tickAttrib,
+                    ticker.contract,
+                )
+                return
 
             setattr(ticker, GREEKS_TICK_MAP[tickType], comp)
             self.pendingTickers.add(ticker)
@@ -1769,9 +1968,6 @@ class Wrapper:
 
     def deltaNeutralValidation(self, reqId: int, dnc: DeltaNeutralContract):
         pass
-
-    def fundamentalData(self, reqId: int, data: str):
-        self.requests.set_result(ReqIdKey(reqId), data)
 
     def scannerParameters(self, xml: str):
         self.requests.set_result(SingletonKey("scannerParams"), xml)
@@ -1883,8 +2079,17 @@ class Wrapper:
     def historicalNews(
         self, reqId: int, time: str, providerCode: str, articleId: str, headline: str
     ):
-        dt = parseIBDatetime(time)
-        dt = cast(datetime, dt)
+        try:
+            dt = parseIBDatetime(time)
+        except ValueError:
+            dt = None
+        if not isinstance(dt, datetime):
+            # Drop a row whose time cannot be parsed. The request still
+            # completes with the other rows.
+            self._logger.error(
+                "historicalNews: unreadable time %r for article %s", time, articleId
+            )
+            return
         article = HistoricalNews(dt, providerCode, articleId, headline)
         self.requests.append(ReqIdKey(reqId), article)
 
@@ -1898,8 +2103,8 @@ class Wrapper:
         self.msgId2NewsBulletin[msgId] = bulletin
         self.ib.newsBulletinEvent.emit(bulletin)
 
-    def receiveFA(self, _faDataType: int, faXmlData: str):
-        self.requests.set_result(SingletonKey("requestFA"), faXmlData)
+    def receiveFA(self, faDataType: int, faXmlData: str):
+        self.requests.set_result(CompositeKey("requestFA", (faDataType,)), faXmlData)
 
     def replaceFAEnd(self, _reqId: int, _text: str):
         # No client-side waiter today; the binary path's wrap() factory
@@ -1981,13 +2186,13 @@ class Wrapper:
         self.requests.set_result(ReqIdKey(reqId), dataJson)
 
     def userInfo(self, reqId: int, whiteBrandingId: str):
-        self.requests.set_result(ReqIdKey(reqId))
+        self.requests.set_result(ReqIdKey(reqId), whiteBrandingId)
 
     def softDollarTiers(self, reqId: int, tiers: list[SoftDollarTier]):
-        pass
+        self.requests.set_result(ReqIdKey(reqId), tiers)
 
     def familyCodes(self, familyCodes: list[FamilyCode]):
-        pass
+        self.requests.set_result(SingletonKey("familyCodes"), familyCodes)
 
     def error(
         self,
@@ -2039,6 +2244,17 @@ class Wrapper:
             # invalid price for a new order must cancel it
             isWarning = False
 
+        if (
+            errorCode in _ENDS_UNMODIFIED_ORDER_CODES
+            and trade
+            and trade.modifyUnconfirmed
+        ):
+            # the order stays live until TWS reports a status that ends it
+            isWarning = True
+            if advancedOrderRejectJson:
+                trade.advancedError = advancedOrderRejectJson
+
+        self.tally.counted(errorCode, isWarning)
         msg = f"{'Warning' if isWarning else 'Error'} {errorCode}, reqId {reqId}: {errorString}"
 
         contract = self.contractForReqId(reqId)
@@ -2060,24 +2276,33 @@ class Wrapper:
                 self._logger.info(msg)
         else:
             self._logger.error(msg)
-            if isRequest:
+            # Before the API starts, an error is the reason TWS refuses
+            # the connection, such as 326 for a client id already in use.
+            self.ib.client.startupError(errorCode, errorString)
+            # A bust event's request is sent again below, not refused.
+            resent = errorCode == 10225 and isinstance(
+                self.subscriptions.get_sub(reqId), HistoricalBarsSub
+            )
+            if isRequest and not resent:
                 # the request failed — settle the future via whichever
                 # typed key it was actually registered under
-                assert inflightRequest is not None
+                assert inflightRequest is not None  # noqa: S101 - narrows for the type checker
                 if self.ib.RaiseRequestErrors:
                     error = RequestError(reqId, errorCode, errorString)
                     self.requests.set_error(inflightRequest.key, error)
                 else:
-                    self.requests.set_result(inflightRequest.key)
+                    self.requests.refuse(inflightRequest.key, errorCode, errorString)
+            elif (owed := self.requests.owedReqIdKey(reqId)) is not None:
+                # the end of an answer owed to a request already ended
+                self.requests.set_result(owed)
             elif trade:
                 # something is wrong with the order, cancel it
                 if advancedOrderRejectJson:
                     trade.advancedError = advancedOrderRejectJson
 
-                # Errors can mean two things:
-                #  - new order is REJECTED
-                #  - existing order is server-canceled (DAY orders, margin problems)
-                #  - modification to *existing* order just has an update error, but the order is STILL LIVE
+                # Errors here mean a new order is REJECTED or an existing order
+                # is server-canceled (DAY orders, margin problems). A refused
+                # modification of a live order took the warning branch above.
                 if not trade.isDone():
                     status = trade.orderStatus.status = OrderStatus.Cancelled
                     logEntry = TradeLogEntry(self.lastTime, status, msg, errorCode)
@@ -2099,29 +2324,35 @@ class Wrapper:
             # Market depth data has been RESET
             ticker = self._get_ticker(reqId)
             if ticker:
-                # clear all DOM levels
+                # clear all DOM levels, reporting each as a delete
+                bids, asks = ticker.dom.clear()
                 ticker.domTicks += [
                     MktDepthData(self.lastTime, 0, "", 2, 0, level.price, 0)
-                    for level in ticker.domAsks
+                    for level in asks
                 ]
                 ticker.domTicks += [
                     MktDepthData(self.lastTime, 0, "", 2, 1, level.price, 0)
-                    for level in ticker.domBids
+                    for level in bids
                 ]
-                ticker.domAsks.clear()
-                ticker.domBids.clear()
-                ticker.domBidsDict.clear()
-                ticker.domAsksDict.clear()
                 self.pendingTickers.add(ticker)
         elif errorCode == 10225:
             # Bust event occurred, current subscription is deactivated.
-            # Re-subscribe immediately so bars keep flowing.
+            # Re-subscribe immediately so bars keep flowing, under a fresh
+            # reqId: whatever IBKR still sends for the old one (such as its
+            # reply to the cancel) then answers nothing.
             sub = self.subscriptions.get_sub(reqId)
+            newReqId = 0
+            if isinstance(sub, RealTimeBarsSub | HistoricalBarsSub):
+                newReqId = self.ib.client.getReqId()
+                self.subscriptions.move(sub, newReqId)
+                self._logger.info(
+                    "Bust event: reqId %s sent again as %s", reqId, newReqId
+                )
             if isinstance(sub, RealTimeBarsSub):
                 rtBars = sub.bars
                 self.ib.client.cancelRealTimeBars(reqId)
                 self.ib.client.reqRealTimeBars(
-                    reqId,
+                    newReqId,
                     rtBars.contract,
                     rtBars.barSize,
                     rtBars.whatToShow,
@@ -2130,9 +2361,22 @@ class Wrapper:
                 )
             elif isinstance(sub, HistoricalBarsSub):
                 hBars = sub.bars
+                # The answer starts over: the request awaiting it (or, once
+                # answered, a new one nobody awaits) fills the bars afresh.
+                hBars.clear()
+                moved = self.requests.move(ReqIdKey(reqId), ReqIdKey(newReqId))
+                if moved is None:
+                    unawaited = self.requests.open(
+                        ReqIdKey(newReqId),
+                        container=hBars,
+                        refusal=refusedAsNone,
+                    ).future
+                    unawaited.add_done_callback(
+                        lambda future: self._refilled(hBars, future)
+                    )
                 self.ib.client.cancelHistoricalData(reqId)
                 self.ib.client.reqHistoricalData(
-                    reqId,
+                    newReqId,
                     hBars.contract,
                     hBars.endDateTime,
                     hBars.durationStr,
@@ -2155,12 +2399,39 @@ class Wrapper:
         # data") is a warning that still completes via tickSnapshotEnd. Close
         # is idempotent, so reqTickersAsync re-closing in its ``finally`` is a
         # no-op.
+        # Likewise a keepUpToDate historical request refused before its
+        # answer: its subscription will never stream, and its caller may
+        # never get the bars to cancel it by. (A bust event's subscription
+        # moved to its fresh reqId above.)
+        # And any stream refused with an error that ends it
+        # (STREAM_ENDING_CODES): left registered, it would be deduplicated
+        # onto by the next request for the contract, which would then get
+        # a Ticker that never updates. Closing keeps the Ticker's data.
         if not isWarning:
             sub = self.subscriptions.get_sub(reqId)
-            if isinstance(sub, MktDataSub) and sub.snapshot:
+            if sub is not None and (
+                (isinstance(sub, MktDataSub) and sub.snapshot)
+                or (isinstance(sub, HistoricalBarsSub) and isRequest)
+                or errorCode in STREAM_ENDING_CODES
+            ):
+                self.tally.subscriptionsRefused += 1
                 sub.close(send_cancel=False)
 
         self.ib.errorEvent.emit(reqId, errorCode, errorString, contract)
+
+    def _refilled(
+        self, bars: BarDataList, refill: asyncio.Future[BarDataList | None]
+    ) -> None:
+        """A bust event's refill of answered ``bars`` has ended: announce
+        the bars, replaced, as an update (nobody awaits the refill), when
+        it was answered; refused (None), cancelled or failed, there is
+        nothing to announce."""
+        # exception() also retrieves an error nobody else will, so it is not
+        # logged as never retrieved
+        answered = not refill.cancelled() and refill.exception() is None
+        if answered and refill.result() is bars:
+            self.ib.barUpdateEvent.emit(bars, True)
+            bars.updateEvent.emit(bars, True)
 
     def tcpDataArrived(self):
         self.lastTime = datetime.now(self.defaultTimezone)
@@ -2185,29 +2456,23 @@ class Wrapper:
 
     def verifyMessageAPI(self, apiData: str):
         """3rd-party API authentication callback (TWS verify dialog)."""
-        pass
 
     def verifyCompleted(self, isSuccessful: bool, errorText: str):
         """3rd-party API authentication completion callback."""
-        pass
 
     def verifyAndAuthMessageAPI(self, apiData: str, xyzChallenge: str):
         """3rd-party API auth+xyz challenge callback."""
-        pass
 
     def verifyAndAuthCompleted(self, isSuccessful: bool, errorText: str):
         """3rd-party API auth+xyz completion callback."""
-        pass
 
     def displayGroupList(self, reqId: int, groups: str):
         """TWS display-group sync — initial list."""
-        pass
 
     def displayGroupUpdated(self, reqId: int, contractInfo: str):
         """TWS display-group sync — update notification."""
-        pass
 
-    def configResponseProtoBuf(self, configResponseProto: Any):
+    def configResponseProtoBuf(self, configResponseProto: ConfigResponse) -> None:
         """Carries nested config sub-messages (LockAndExitConfig,
         ApiConfig, MessageConfig, OrdersConfig). Raw proto delivery —
         no domain dataclass equivalent exists. Settles the matching
@@ -2218,7 +2483,9 @@ class Wrapper:
                 ReqIdKey(configResponseProto.reqId), configResponseProto
             )
 
-    def updateConfigResponseProtoBuf(self, updateConfigResponseProto: Any):
+    def updateConfigResponseProtoBuf(
+        self, updateConfigResponseProto: UpdateConfigResponse
+    ) -> None:
         """Carries config-update result + changed-fields list. Raw
         proto delivery — no domain dataclass equivalent exists.
         Settles the matching ReqIdKey if the proto carries a reqId so

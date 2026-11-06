@@ -437,8 +437,7 @@ def test_start_api_request_proto_round_trip():
 
 
 def test_start_api_request_proto_empty_optional_capabilities_omitted():
-    # IBKR Java EClientUtils + Python client_utils both gate the
-    # ``optionalCapabilities`` set on a non-empty check. Setting an empty
+    # ``optionalCapabilities`` is written only when non-empty. Setting an empty
     # string explicitly serializes as a present-but-empty field
     # (``HasField`` is True), which the TWS gateway rejects on the
     # startApi frame and silently closes the socket — leaving the user
@@ -446,7 +445,7 @@ def test_start_api_request_proto_empty_optional_capabilities_omitted():
     proto = createStartApiRequestProto(clientId=71, optionalCapabilities="")
     assert proto.clientId == 71
     assert not proto.HasField("optionalCapabilities")
-    # Byte-exact parity with IBKR reference output for clientId=71/empty.
+    # The exact bytes: field 1 (clientId) = 71, nothing else.
     assert proto.SerializeToString() == b"\x08\x47"
 
 

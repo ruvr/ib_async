@@ -1,11 +1,13 @@
 """Financial instrument types used by Interactive Brokers."""
 
+from __future__ import annotations
+
 import datetime as dt
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
-import ib_async.util as util
+from ib_async import util
 
 
 @dataclass
@@ -102,11 +104,11 @@ class Contract:
     description: str = ""
     issuerId: str = ""
     comboLegsDescrip: str = ""
-    comboLegs: list["ComboLeg"] = field(default_factory=list)
-    deltaNeutralContract: Optional["DeltaNeutralContract"] = None
+    comboLegs: list[ComboLeg] = field(default_factory=list)
+    deltaNeutralContract: DeltaNeutralContract | None = None
 
     @staticmethod
-    def create(**kwargs) -> "Contract":
+    def create(**kwargs) -> Contract:
         """
         Create and a return a specialized contract based on the given secType,
         or a general Contract if secType is not given.
@@ -140,25 +142,30 @@ class Contract:
         return cls(**kwargs)
 
     @staticmethod
-    def recreate(c) -> "Contract":
+    def recreate(c) -> Contract:
         """Convert an existing generic Contract into its most specific type."""
         return Contract.create(**util.dataclassAsDict(c))
 
     def isHashable(self) -> bool:
-        """
-        See if this contract can be hashed by conId.
-
-        Note: Bag contracts always get conId=28812380, so they're not hashable by conId,
-              but we generate a synthetic hash for them based on leg details instead.
-        """
-        return bool(self.conId)
+        """Whether this contract can be hashed: a bag always (by its legs,
+        whatever its conId: IBKR gives many different spreads one combo
+        conId, such as 28812380, and a bag of the user's own often has 0),
+        any other contract once qualified (by its conId)."""
+        return self.secType == "BAG" or bool(self.conId)
 
     def __eq__(self, other):
-        return isinstance(other, Contract) and (
-            self.conId
-            and self.conId == other.conId
-            or util.dataclassAsDict(self) == util.dataclassAsDict(other)
-        )
+        # Equal by conId, as they hash, except for a bag (IBKR gives many
+        # different spreads the same combo conId) and a continuous future
+        # against the front contract it shares its conId with: those compare
+        # every field. (Equal contracts hash alike; a bag of the user's own
+        # and IBKR's copy of it hash alike by their legs, but differ in conId.)
+        if not isinstance(other, Contract):
+            return False
+        kinds = (self.secType, other.secType)
+        byConId = "BAG" not in kinds and kinds.count("CONTFUT") != 1
+        if byConId and self.conId and self.conId == other.conId:
+            return True
+        return util.dataclassAsDict(self) == util.dataclassAsDict(other)
 
     def __hash__(self) -> int:
         if self.secType == "BAG":
@@ -177,24 +184,18 @@ class Contract:
                 f"Contract {self} can't be hashed because no 'conId' value exists. Qualify contract to populate 'conId'."
             )
 
-        if self.secType == "CONTFUT":
-            # CONTFUT gets the same conId as the front contract, invert it here
-            h = -self.conId
-        else:
-            h = self.conId
-
-        return h
+        # CONTFUT gets the same conId as the front contract, invert it here
+        return -self.conId if self.secType == "CONTFUT" else self.conId
 
     def __repr__(self):
-        attrs = util.dataclassNonDefaults(self)
+        attrs = util.dataclassDisplayFields(self)
 
         if self.__class__ is not Contract:
             attrs.pop("secType", "")
 
         clsName = self.__class__.__qualname__
-        kwargs = ", ".join(f"{k}={v!r}" for k, v in attrs.items())
 
-        return f"{clsName}({kwargs})"
+        return f"{clsName}({util.dataclassDisplayPairs(attrs)})"
 
     __str__ = __repr__
 
@@ -354,7 +355,8 @@ class Forex(Contract):
             currency: Quote currency.
         """
         if pair:
-            assert len(pair) == 6
+            if len(pair) != 6:
+                raise ValueError(f"pair must be 6 letters like 'EURUSD', got {pair!r}")
             symbol = symbol or pair[:3]
             currency = currency or pair[3:]
 
@@ -363,14 +365,13 @@ class Forex(Contract):
         )
 
     def __repr__(self):
-        attrs = util.dataclassNonDefaults(self)
+        attrs = util.dataclassDisplayFields(self)
         attrs.pop("secType")
         s = "Forex("
         if "symbol" in attrs and "currency" in attrs:
-            pair = attrs.pop("symbol")
-            pair += attrs.pop("currency")
+            pair = f"{attrs.pop('symbol')}{attrs.pop('currency')}"
             s += "'" + pair + "'" + (", " if attrs else "")
-        s += ", ".join(f"{k}={v!r}" for k, v in attrs.items())
+        s += util.dataclassDisplayPairs(attrs)
         s += ")"
         return s
 
@@ -550,10 +551,10 @@ class TradingSession(NamedTuple):
     end: dt.datetime
 
 
-@dataclass
+@dataclass(slots=True, frozen=True)
 class IneligibilityReason:
-    # ``id_`` (trailing underscore) mirrors IBKR's reference dataclass —
-    # ``id`` shadows the Python builtin so the upstream chose ``id_``.
+    # ``id_`` (trailing underscore) because ``id`` shadows the Python
+    # builtin.
     id_: str = ""
     description: str = ""
 
@@ -633,6 +634,8 @@ class ContractDetails:
     eventContract1: str = ""
     eventContractDescription1: str = ""
     eventContractDescription2: str = ""
+    # How the contract settles on expiry: "Physical" or "Cash".
+    settlementMethod: str = ""
 
     def tradingSessions(self) -> list[TradingSession]:
         return self._parseSessions(self.tradingHours)

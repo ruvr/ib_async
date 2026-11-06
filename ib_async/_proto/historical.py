@@ -18,9 +18,9 @@ Wire shape notes:
   takes positional args ``(reqId, time, open, high, low, close, volume,
   wap, count)``.
 * ``HistoricalTick`` family ``size`` fields are strings; ``time`` is
-  int64 (epoch seconds). ``HistoricalTick`` records remain
-  ``float``-typed in this commit pending the Ticker hot-path benchmark
-  (see ``_proto/market_data.py`` rationale).
+  int64 (epoch seconds). ``HistoricalTick`` records are
+  ``float``-typed, as the Ticker's tick path is (see
+  ``_proto/market_data.py``).
 * ``HistoricalSchedule`` carries a repeated ``HistoricalSession`` slot;
   the converter unpacks it into the existing domain ``HistoricalSchedule``
   dataclass with ``HistoricalSession`` children.
@@ -459,9 +459,9 @@ def createHistoricalDataRequestProto(
     keepUpToDate: bool,
     chartOptions: list[TagValue] | None = None,
 ) -> HistoricalDataRequest_pb2.HistoricalDataRequest:
-    # Each scalar gated per IBKR's ``client_utils.createHistoricalDataRequestProto``:
-    # reqId / formatDate via isValidIntValue; strings via non-empty;
-    # bools via truthy.
+    # Each scalar is written only when set, as IBKR's server expects:
+    # ints unless the UNSET_INTEGER sentinel; strings when non-empty;
+    # bools when true.
     proto = HistoricalDataRequest_pb2.HistoricalDataRequest()
     if reqId != UNSET_INTEGER:
         proto.reqId = reqId
@@ -616,8 +616,7 @@ def createCancelContractDataProto(
     reqId: int,
 ) -> CancelContractData_pb2.CancelContractData:
     """Build a CancelContractData proto. Proto-only message family —
-    the binary path has no equivalent. Mirrors IBKR's reference
-    ``client_utils.createCancelContractDataProto``.
+    the binary path has no equivalent.
     """
     proto = CancelContractData_pb2.CancelContractData()
     if reqId != UNSET_INTEGER:

@@ -19,8 +19,7 @@ Wire-shape notes:
   case) — args dataclass uses the wrapper's spelling.
 * ``WshEventDataRequest`` is built from a ``WshEventData`` domain
   dataclass on the send side; ``None`` from the domain object skips the
-  proto write entirely (mirrors IBKR's ``isValidIntValue`` gating from
-  ``client_utils.createWshEventDataRequestProto``).
+  proto write entirely.
 """
 
 from __future__ import annotations
@@ -230,8 +229,7 @@ def createNewsArticleRequestProto(
     ``newsArticleOptions`` is the documented TagValue trailer the binary
     path sends as a single concatenated string after ``articleId``. The
     proto wire spells it ``newsArticleOptions`` (a
-    ``map<string, string>``); empty / ``None`` leaves the field unset —
-    matching IBKR's ``client_utils.createNewsArticleRequestProto``.
+    ``map<string, string>``); empty / ``None`` leaves the field unset.
     """
     proto = NewsArticleRequest_pb2.NewsArticleRequest()
     if reqId != UNSET_INTEGER:
@@ -295,8 +293,7 @@ def createHistoricalNewsRequestProto(
     ``historicalNewsOptions`` is the documented TagValue trailer the
     binary path sends after ``totalResults``. The proto wire spells it
     ``historicalNewsOptions`` (a ``map<string, string>``); empty /
-    ``None`` leaves the field unset — matching IBKR's
-    ``client_utils.createHistoricalNewsRequestProto``.
+    ``None`` leaves the field unset.
     """
     proto = HistoricalNewsRequest_pb2.HistoricalNewsRequest()
     if reqId != UNSET_INTEGER:
@@ -415,9 +412,7 @@ def createWshEventDataRequestProto(
     # ``WshEventData`` dataclass — the universal unset marker. Writing
     # the field with no user-supplied value would have IBKR's server
     # interpret a sentinel as a real contract id and reject the
-    # subscription. Skip the write when the domain value is ``None``,
-    # mirroring IBKR's ``isValidIntValue`` gating from
-    # ``client_utils.createWshEventDataRequestProto``.
+    # subscription. Skip the write when the domain value is ``None``.
     if _isValidInt(data.conId):
         proto.conId = data.conId
     if data.filter:

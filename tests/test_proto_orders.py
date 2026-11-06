@@ -19,12 +19,15 @@ Additional negative coverage:
 
 from __future__ import annotations
 
+import math
+import sys
 from decimal import Decimal
 
 import pytest
 
 from ib_async._pb import (
     AttachedOrders_pb2,
+    ComboLeg_pb2,
     CommissionAndFeesReport_pb2,
     Contract_pb2,
     Execution_pb2,
@@ -32,6 +35,7 @@ from ib_async._pb import (
     ExecutionRequest_pb2,
     OpenOrder_pb2,
     Order_pb2,
+    OrderCondition_pb2,
     OrderState_pb2,
     OrderStatus_pb2,
     PlaceOrderRequest_pb2,
@@ -49,9 +53,18 @@ from ib_async._proto.orders import (
     createOrderStatus,
     createPlaceOrderRequestProto,
 )
-from ib_async.contract import Stock
+from ib_async.contract import Stock, TagValue
 from ib_async.objects import ExecutionFilter
-from ib_async.order import LimitOrder, MarketOrder, Order
+from ib_async.order import (
+    ExecutionCondition,
+    MarginCondition,
+    Order,
+    PercentChangeCondition,
+    PriceCondition,
+    TimeCondition,
+    VolumeCondition,
+)
+from ib_async.ordertypes import LimitOrder, MarketOrder
 
 # ---------------------------------------------------------------------------
 # CRITICAL regression: clientId must round-trip
@@ -137,7 +150,11 @@ def test_create_order_round_trip_all_primary_fields():
         hidden=True,
     )
     proto = createOrderProto(src)
-    decoded = createOrder(proto)
+    # ``orderId`` rides the REQUEST ENVELOPE, not ``Order`` — IBKR's
+    # reference never writes it on send, so the decoder is handed the
+    # envelope's id exactly as ``createOpenOrder`` hands it over.
+    assert not proto.HasField("orderId")
+    decoded = createOrder(proto, orderId=src.orderId)
     assert decoded.orderId == 7
     assert decoded.clientId == 11
     assert decoded.permId == 999
@@ -175,8 +192,8 @@ def test_create_order_proto_writes_decimal_quantity_via_canonical_string():
 def test_create_order_proto_coerces_none_plain_int_fields_to_dataclass_default():
     # Live regression: icli's whatIf-preview path stamps
     # ``parentId = None`` on a fresh-copy Order to suppress the parent
-    # link. The binary path's ``_FORMAT_HANDLERS[type(None)] = lambda
-    # _: ""`` formatter mapped that to ``""``, which TWS parses as the
+    # link. The binary path's ``_formatField`` writes None as ``""``,
+    # which TWS parses as the
     # field's wire default (``0`` for ``parentId``). The protobuf path
     # has no equivalent and used to skip the field entirely, leaving
     # TWS to read proto3-absent as its own ``UNSET_INTEGER`` sentinel
@@ -205,9 +222,21 @@ def test_create_order_proto_coerces_none_plain_int_fields_to_dataclass_default()
     assert proto.HasField("exemptCode") and proto.exemptCode == -1
 
 
+def test_create_order_proto_conditions_include_overnight_is_truthy_gated():
+    """Written only when truthy: the default stays off the wire, so
+    orders that never set it encode exactly as before the field existed."""
+    order = LimitOrder("BUY", 1, 10)
+    assert not createOrderProto(order).HasField("conditionsIncludeOvernight")
+
+    order.conditionsIncludeOvernight = True
+    proto = createOrderProto(order)
+    assert proto.HasField("conditionsIncludeOvernight")
+    assert proto.conditionsIncludeOvernight is True
+
+
 def test_limit_order_constructor_coerces_user_floats_to_decimal():
     # User-friendly ``LimitOrder("BUY", 100, 50.5)`` round-trips through
-    # ``_toDecimal`` so the wire-side gets a clean Decimal even though
+    # ``finiteDecimal`` so the wire-side gets a clean Decimal even though
     # the user passed floats.
     order = LimitOrder("BUY", 100, 50.5)
     assert isinstance(order.totalQuantity, Decimal)
@@ -275,7 +304,6 @@ def test_whatIf_unset_stays_off_the_wire():
 
 
 def test_algo_strategy_and_params_round_trip():
-    from ib_async.contract import TagValue
 
     order = LimitOrder("BUY", 100, 50.5)
     order.algoStrategy = "Adaptive"
@@ -665,11 +693,11 @@ def test_cancel_order_request_skips_unset_optional_fields():
 
 
 # ---------------------------------------------------------------------------
-# Parity with IBKR's ``decoder_utils.decodeOrder`` — every field IBKR
-# reads, we read.
+# Every wire field on the Order proto that maps to a domain attribute
+# is read.
 #
-# Wire fields IBKR's reference reads that our domain ``Order`` dataclass
-# does NOT carry (and therefore the converter intentionally drops):
+# Wire fields our domain ``Order`` dataclass does NOT carry (and therefore
+# the converter intentionally drops):
 # ``customerAccount``, ``professionalCustomer``, ``bondAccruedInterest``,
 # ``includeOvernight``, ``manualOrderIndicator``, ``submitter``,
 # ``deactivate``, ``postOnly``, ``allowPreOpen``, ``ignoreOpenAuction``,
@@ -680,15 +708,12 @@ def test_cancel_order_request_skips_unset_optional_fields():
 # ---------------------------------------------------------------------------
 
 
-def test_create_order_reads_every_field_decoder_utils_reads():
-    """Mirror IBKR's ``decoder_utils.decodeOrder`` field list.
-
-    Every wire field IBKR's reference reads (and that maps to a real
-    domain attribute) MUST round-trip here. If this test fails because
-    a field IBKR newly reads landed unread, the converter is silently
-    losing wire state — fail loud.
+def test_create_order_reads_every_order_field():
+    """Every wire field on the Order proto (that maps to a real domain
+    attribute) MUST round-trip here. If this test fails because a
+    field landed unread, the converter is silently losing wire state —
+    fail loud.
     """
-    from ib_async._pb import OrderCondition_pb2
 
     proto = Order_pb2.Order()
     proto.orderId = 11
@@ -788,6 +813,7 @@ def test_create_order_reads_every_field_decoder_utils_reads():
     cond.triggerMethod = 0
     proto.conditions.append(cond)
     proto.conditionsIgnoreRth = True
+    proto.conditionsIncludeOvernight = True
     proto.conditionsCancelOrder = True
     proto.adjustedOrderType = "STP"
     proto.triggerPrice = 48.0
@@ -931,7 +957,6 @@ def test_create_order_reads_every_field_decoder_utils_reads():
     # Conditions
     assert len(order.conditions) == 1
     pc = order.conditions[0]
-    from ib_async.order import PriceCondition
 
     assert isinstance(pc, PriceCondition)
     assert pc.conjunction == "a"
@@ -940,6 +965,7 @@ def test_create_order_reads_every_field_decoder_utils_reads():
     assert pc.exch == "SMART"
     assert pc.price == 99.5
     assert order.conditionsIgnoreRth is True
+    assert order.conditionsIncludeOvernight is True
     assert order.conditionsCancelOrder is True
     # Adjustable
     assert order.adjustedOrderType == "STP"
@@ -1038,7 +1064,6 @@ def test_create_order_combo_legs_sourced_from_contract_proto():
     """``orderComboLegs`` per-leg prices live on the CONTRACT proto, not
     the order proto. ``createOrder`` must read them from the contract
     proto when supplied."""
-    from ib_async._pb import ComboLeg_pb2
 
     contractProto = Contract_pb2.Contract()
     leg = ComboLeg_pb2.ComboLeg()
@@ -1067,7 +1092,6 @@ def test_open_order_envelope_propagates_combo_legs_to_order():
     """End-to-end: an OpenOrder envelope with combo legs on its
     contract message must surface those legs on the decoded
     ``Order.orderComboLegs``."""
-    from ib_async._pb import ComboLeg_pb2
 
     proto = OpenOrder_pb2.OpenOrder()
     proto.orderId = 1
@@ -1084,17 +1108,8 @@ def test_open_order_envelope_propagates_combo_legs_to_order():
 
 def test_create_order_conditions_decode_each_subclass():
     """Each OrderCondition subclass (price/time/margin/exec/volume/pct)
-    must round-trip the subclass-specific fields. IBKR's reference
-    dispatches on ``type``; we mirror that table."""
-    from ib_async._pb import OrderCondition_pb2
-    from ib_async.order import (
-        ExecutionCondition,
-        MarginCondition,
-        PercentChangeCondition,
-        PriceCondition,
-        TimeCondition,
-        VolumeCondition,
-    )
+    must round-trip the subclass-specific fields. Decoding dispatches
+    on the wire ``type``."""
 
     proto = Order_pb2.Order()
 
@@ -1263,3 +1278,19 @@ def test_execution_request_proto_carries_filter_with_new_fields():
     assert parsed.executionFilter.clientId == 3
     assert parsed.executionFilter.lastNDays == 2
     assert list(parsed.executionFilter.specificDates) == [20260101]
+
+
+def test_compete_up_to_mid_round_trips_through_proto():
+    order = Order(orderType="PEG BEST", competeAgainstBestOffset=math.inf)
+    proto = createOrderProto(order)
+    assert proto.competeAgainstBestOffset == math.inf
+    assert createOrder(proto).competeAgainstBestOffset == Decimal("Infinity")
+
+
+def test_the_unset_double_decodes_as_unset_for_compete_against_best_offset():
+    """As on the binary path and for the mid offsets beside it."""
+    proto = Order_pb2.Order(
+        competeAgainstBestOffset=sys.float_info.max, midOffsetAtWhole=sys.float_info.max
+    )
+    order = createOrder(proto)
+    assert (order.competeAgainstBestOffset, order.midOffsetAtWhole) == (None, None)

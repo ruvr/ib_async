@@ -472,8 +472,7 @@ def createStartApiRequestProto(
     proto = StartApiRequest_pb2.StartApiRequest()
     if clientId != UNSET_INTEGER:
         proto.clientId = clientId
-    # IBKR's reference clients (Java EClientUtils, Python client_utils) gate
-    # this on a non-empty check. With proto3 ``optional`` semantics an
+    # Written only when non-empty. With proto3 ``optional`` semantics an
     # explicit empty-string assignment serializes as a present-but-empty
     # field (``HasField`` returns True), which the TWS gateway rejects on
     # the startApi frame and silently closes the socket.
@@ -554,9 +553,8 @@ def createCalculateImpliedVolatilityRequestProto(
 ) -> CalculateImpliedVolatilityRequest_pb2.CalculateImpliedVolatilityRequest:
     """Build a ``CalculateImpliedVolatilityRequest`` from caller args.
 
-    Mirrors IBKR's ``client_utils.createCalculateImpliedVolatilityRequestProto``:
-    forwards ``impliedVolatilityOptions`` as the proto's ``map<string, string>``
-    so user-supplied trailers reach the wire.
+    Forwards ``impliedVolatilityOptions`` as the proto's
+    ``map<string, string>`` so user-supplied trailers reach the wire.
     """
     proto = CalculateImpliedVolatilityRequest_pb2.CalculateImpliedVolatilityRequest()
     if _isValidInt(reqId):
@@ -579,8 +577,7 @@ def createCalculateOptionPriceRequestProto(
 ) -> CalculateOptionPriceRequest_pb2.CalculateOptionPriceRequest:
     """Build a ``CalculateOptionPriceRequest`` from caller args.
 
-    Mirrors IBKR's ``client_utils.createCalculateOptionPriceRequestProto``:
-    forwards ``optionPriceOptions`` as the proto's ``map<string, string>``
+    Forwards ``optionPriceOptions`` as the proto's ``map<string, string>``
     so user-supplied trailers reach the wire.
     """
     proto = CalculateOptionPriceRequest_pb2.CalculateOptionPriceRequest()
@@ -625,10 +622,9 @@ def createCancelCalculateOptionPriceProto(
 
 
 def createConfigRequestProto(reqId: int) -> ConfigRequest_pb2.ConfigRequest:
-    """Build a ``ConfigRequest`` proto carrying only ``reqId``. Mirrors
-    IBKR's ``client.py:reqConfigProtoBuf`` send shape — the request
-    body is just an int identifier; the full config payload comes
-    back on the response side.
+    """Build a ``ConfigRequest`` proto carrying only ``reqId``. The
+    request body is just an int identifier; the full config payload
+    comes back on the response side.
     """
     proto = ConfigRequest_pb2.ConfigRequest()
     proto.reqId = reqId
@@ -646,8 +642,7 @@ def createUpdateConfigRequestProto(
 ) -> UpdateConfigRequest_pb2.UpdateConfigRequest:
     """Build an ``UpdateConfigRequest`` proto.
 
-    Mirrors IBKR's ``client.py:updateConfigProtoBuf`` send shape — the
-    request carries the full nested config family (lock-and-exit /
+    The request carries the full nested config family (lock-and-exit /
     messages / api / orders) plus a list of warnings the user has
     accepted and an opt-in flag to reset the API order sequence.
 

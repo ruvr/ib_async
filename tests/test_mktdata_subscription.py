@@ -11,11 +11,13 @@ Two correctness properties to verify:
      every bookkeeping trace.
 """
 
+from __future__ import annotations
+
 from unittest.mock import MagicMock
 
 import ib_async as ibi
 from ib_async._subscriptions import MktDataSub
-from ib_async.contract import Bag, ComboLeg
+from ib_async.contract import Bag, ComboLeg, Contract
 
 
 def _wired_ib():
@@ -175,3 +177,73 @@ def test_cancel_distinct_bag_leaves_other_bag_live():
         ib.wrapper.subscriptions.find_market_data_for_contract(bag_b, "mktData")
         is not None
     )
+
+
+def _bag(conId: int, firstLeg: int) -> Bag:
+    return Bag(
+        conId=conId,
+        symbol="CL",
+        exchange="NYMEX",
+        currency="USD",
+        comboLegs=[
+            ComboLeg(conId=firstLeg, ratio=1, action="BUY", exchange="NYMEX"),
+            ComboLeg(conId=firstLeg + 1, ratio=1, action="SELL", exchange="NYMEX"),
+        ],
+    )
+
+
+def test_distinct_bags_sharing_a_conid_are_distinct_subscriptions():
+    """IBKR reports one combo conId (such as 28812380) on many spreads: two
+    BAGs with different legs are still two subscriptions with two tickers."""
+    ib = _wired_ib()
+    first, second = _bag(28812380, 1000), _bag(28812380, 2000)
+    firstTicker = ib.reqMktData(first)
+    secondTicker = ib.reqMktData(second)
+    assert firstTicker is not secondTicker
+    assert ib.client.reqMktData.call_count == 2
+    assert ib.ticker(first) is firstTicker
+    assert ib.ticker(second) is secondTicker
+    assert ib.cancelMktData(second) is True
+    assert ib.ticker(first) is firstTicker
+
+
+def test_bags_compare_by_legs_not_by_a_shared_conid():
+    """Equal contracts must hash equal: BAGs hash by their legs, so they
+    compare by them too."""
+    first, second = _bag(28812380, 1000), _bag(28812380, 2000)
+    assert first != second
+    assert first == _bag(28812380, 1000)
+    assert hash(first) == hash(_bag(28812380, 1000))
+
+
+def _spread(*conIds: int) -> Contract:
+    return Contract(
+        secType="BAG",
+        symbol="SPY",
+        exchange="SMART",
+        conId=28812380,
+        comboLegs=[ComboLeg(conId=c, ratio=1, action="BUY") for c in conIds],
+    )
+
+
+def test_contract_equality_agrees_with_its_hash_both_ways():
+    """Contracts that compare equal hash alike, whichever side asks."""
+    bag = _spread(1, 2)
+    single = Contract(secType="STK", conId=bag.conId)
+    assert bag != single and single != bag
+    assert _spread(1, 2) == bag and hash(_spread(1, 2)) == hash(bag)
+
+    front = Contract(secType="FUT", conId=7)
+    continuous = Contract(secType="CONTFUT", conId=7)
+    assert front != continuous and continuous != front
+    assert Contract(conId=7) == front and hash(Contract(conId=7)) == hash(front)
+
+
+def test_a_continuous_future_and_its_front_future_are_separate_subscriptions():
+    ib = _wired_ib()
+    front = Contract(secType="FUT", symbol="ES", conId=7, exchange="CME")
+    continuous = Contract(secType="CONTFUT", symbol="ES", conId=7, exchange="CME")
+    ib.reqMktData(continuous)
+    subs = ib.wrapper.subscriptions
+    assert subs.find_market_data_for_contract(continuous, "mktData") is not None
+    assert subs.find_market_data_for_contract(front, "mktData") is None

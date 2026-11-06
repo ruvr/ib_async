@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import dataclasses
+import numbers
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import ClassVar, NamedTuple
+from types import GenericAlias, MappingProxyType, UnionType
+from typing import ClassVar, NamedTuple, TypeAlias, get_args, get_type_hints
 
 from eventkit import Event
 
 from .contract import Contract, TagValue
-from .objects import Fill, SoftDollarTier, TradeLogEntry, _install_commission_alias
-from .util import UNSET_DOUBLE, dataclassNonDefaults
+from .objects import Fill, SoftDollarTier, TradeLogEntry, _CommissionAlias
+from .util import (
+    UNSET_DOUBLE,
+    dataclassDisplayFields,
+    dataclassDisplayPairs,
+    dataclassRepr,
+)
 
 
 @dataclass
@@ -140,12 +149,14 @@ class Order:
     conditions: list[OrderCondition] = field(default_factory=list)
     conditionsCancelOrder: bool = False
     conditionsIgnoreRth: bool = False
+    # Let conditions also evaluate during the overnight session. Only
+    # the protobuf order path carries it; the text wire has no slot.
+    conditionsIncludeOvernight: bool = False
     extOperator: str = ""
-    # Attached-order (stop-loss / profit-take) cross-references — IBKR
-    # reference ``ibapi/order.py`` carries them; the wire ships them on
-    # the ``PlaceOrderRequest.attachedOrders`` sub-message rather than
-    # ``Order`` itself, but the domain dataclass keeps them here so user
-    # code at the call site has a single object to populate.
+    # Attached-order (stop-loss / profit-take) cross-references. The wire
+    # ships them on the ``PlaceOrderRequest.attachedOrders`` sub-message
+    # rather than ``Order`` itself, but the domain dataclass keeps them
+    # here so user code at the call site has a single object to populate.
     slOrderId: int | None = None
     slOrderType: str = ""
     ptOrderId: int | None = None
@@ -193,8 +204,11 @@ class Order:
     # logging. Empty means IBKR did not supply one for this order.
     submitter: str = ""
     # ``allowPreOpen`` / ``ignoreOpenAuction`` control auction-window
-    # routing. ``deactivate`` flags the order to be killed on fill or
-    # completion. ``postOnly`` rejects an order that would immediately
+    # routing. ``deactivate`` parks the order: it stays stored at IBKR
+    # but is not submitted and cannot execute until it is transmitted
+    # again from the API, TWS, or Client Portal — unlike
+    # ``transmit=False``, which never leaves the TWS session and is lost
+    # at logout. ``postOnly`` rejects an order that would immediately
     # match (maker-only constraint). ``seekPriceImprovement`` /
     # ``whatIfType`` / ``hedgeMaxSize`` parameterize specialized order
     # types. All accept ``None`` to mean "leave at server default".
@@ -207,16 +221,12 @@ class Order:
     hedgeMaxSize: int | None = None
 
     def __repr__(self):
-        attrs = dataclassNonDefaults(self)
-        if self.__class__ is not Order:
-            attrs.pop("orderType", None)
-
+        attrs = dataclassDisplayFields(self)
         if not self.softDollarTier:
-            attrs.pop("softDollarTier")
+            attrs.pop("softDollarTier", None)
 
         clsName = self.__class__.__qualname__
-        kwargs = ", ".join(f"{k}={v!r}" for k, v in attrs.items())
-        return f"{clsName}({kwargs})"
+        return f"{clsName}({dataclassDisplayPairs(attrs)})"
 
     __str__ = __repr__
 
@@ -226,138 +236,105 @@ class Order:
     def __hash__(self):
         return id(self)
 
-    # Quantity / price fields that must be ``Decimal`` (or ``None``).
-    # ``__post_init__`` coerces user-supplied ``float`` / ``int`` /
-    # ``str`` values for these to ``Decimal`` via ``str()`` so a clean
-    # ``Order(lmtPrice=50.5)`` user-construction lands the right type
-    # without forcing every caller to write ``Decimal('50.5')``.
-    _DECIMAL_FIELDS: ClassVar[tuple[str, ...]] = (
-        "totalQuantity",
-        "filledQuantity",
-        "lmtPrice",
-        "auxPrice",
-        "trailStopPrice",
-        "trailingPercent",
-        "lmtPriceOffset",
-        "triggerPrice",
-        "adjustedStopPrice",
-        "adjustedStopLimitPrice",
-        "adjustedTrailingAmount",
-    )
+    # The Decimal fields where IBKR gives +Infinity a meaning, kept instead
+    # of unset: COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID.
+    _INFINITE_FIELDS: ClassVar[frozenset[str]] = frozenset({"competeAgainstBestOffset"})
 
     def __post_init__(self) -> None:
-        for name in self._DECIMAL_FIELDS:
+        # Coerce user-supplied ``float`` / ``int`` / ``str`` values of the
+        # Decimal fields to ``Decimal`` via ``str()``, so
+        # ``Order(lmtPrice=50.5)`` lands the right type without every caller
+        # writing ``Decimal('50.5')``.
+        # Always coerce, even pre-coerced ``Decimal`` inputs, so a stray
+        # ``Decimal('NaN')`` from user code lands as ``None`` instead of
+        # as a silently-truthy ``Decimal('NaN')`` that breaks every
+        # downstream ``if order.lmtPrice:`` guard and puts "NaN" on the
+        # wire.
+        for name in _DECIMAL_FIELDS:
             v = getattr(self, name)
-            if v is None:
-                continue
-            # Always route through ``_toDecimal`` — even pre-coerced
-            # ``Decimal`` inputs — so a stray ``Decimal('NaN')`` /
-            # ``Decimal('Infinity')`` from user code lands as ``None``
-            # instead of as a silently-truthy ``Decimal('NaN')`` that
-            # breaks every downstream ``if order.lmtPrice:`` guard and
-            # corrupts ``_decimalToWireString`` to emit ``"NaN"`` on
-            # the wire.
-            setattr(self, name, _toDecimal(v))
+            if v is not None:
+                setattr(self, name, orderDecimal(name, v))
 
 
-def _toDecimal(value: Decimal | float | int | str | None) -> Decimal | None:
+def takesInfinity(field: str) -> bool:
+    """Whether IBKR gives +Infinity a meaning in Order's Decimal
+    ``field``, which then holds it rather than unset."""
+    return field in Order._INFINITE_FIELDS
+
+
+def orderDecimal(field: str, value: Decimal | float | str | None) -> Decimal | None:
+    """``value`` as Order's Decimal ``field`` holds it: a finite Decimal
+    (:func:`finiteDecimal`), or +Infinity too where IBKR gives it a
+    meaning (:func:`takesInfinity`); None for anything else."""
+    if takesInfinity(field):
+        return decimalOrInfinity(value)
+    return finiteDecimal(value)
+
+
+def finiteDecimal(
+    value: Decimal | float | numbers.Real | str | None,
+) -> Decimal | None:
     """Coerce a user-supplied numeric to ``Decimal | None``.
 
-    Goes through ``str()`` for floats so binary-float imprecision (e.g.
-    ``Decimal(0.1) → Decimal('0.1000000000000000055...')``) doesn't
-    contaminate user-provided fractional-share quantities or option
-    prices. ``None`` / ``""`` / ``float('nan')`` / ``float('inf')`` /
-    ``Decimal('NaN')`` / ``Decimal('Infinity')`` all round-trip to
-    ``None`` so the ``Decimal | None`` field semantics hold: ``None``
-    is the unset sentinel and ``if order.lmtPrice:`` checks stay
-    correct, instead of a silently-truthy ``Decimal('NaN')`` slipping
-    past the guard and corrupting downstream wire writes.
+    Floats are converted through ``str()`` so binary-float error (e.g.
+    ``Decimal(0.1) → Decimal('0.1000000000000000055...')``) does not leak
+    into fractional-share quantities or option prices. numpy numbers also
+    convert through their printed value.
+
+    ``None``, ``""``, ``float('nan')``, ``float('inf')``, ``Decimal('NaN')``,
+    ``Decimal('Infinity')``, a bool, and a non-numeric string all return
+    ``None``. ``None`` means unset, so ``if order.lmtPrice:`` checks stay
+    correct. A ``Decimal('NaN')`` would be truthy, pass that check, and
+    corrupt the wire message.
     """
     if value is None or value == "":
         return None
     if isinstance(value, Decimal):
-        if value.is_nan() or value.is_infinite():
-            return None
-        return value
+        return value if value.is_finite() else None
+    if isinstance(value, bool):
+        return None  # True is no price
+    if isinstance(value, numbers.Integral):
+        return Decimal(int(value))  # exactly, numpy's ints too
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
-    if result.is_nan() or result.is_infinite():
+    return result if result.is_finite() else None
+
+
+# competeAgainstBestOffset for a Pegged to Best order that competes up to the
+# midpoint; sent as "Infinity".
+COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID = Decimal("Infinity")
+
+
+def decimalOrInfinity(value: Decimal | float | str | None) -> Decimal | None:
+    """Like ``finiteDecimal``, but keep +Infinity as Decimal("Infinity").
+
+    Used for fields where IBKR gives +Infinity a meaning; any spelling of
+    it IBKR sends or reads is accepted. IBKR's unset double becomes None,
+    as for any other field."""
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
         return None
-    return result
+    if number.is_nan():
+        return None
+    if number == COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID:
+        return COMPETE_AGAINST_BEST_OFFSET_UP_TO_MID
+    if float(number) == UNSET_DOUBLE:
+        return None
+    return finiteDecimal(value)
 
 
-class LimitOrder(Order):
-    def __init__(
-        self,
-        action: str,
-        totalQuantity: Decimal | float | int | str,
-        lmtPrice: Decimal | float | int | str,
-        **kwargs,
-    ):
-        Order.__init__(
-            self,
-            orderType="LMT",
-            action=action,
-            totalQuantity=_toDecimal(totalQuantity),
-            lmtPrice=_toDecimal(lmtPrice),
-            **kwargs,
-        )
-
-
-class MarketOrder(Order):
-    def __init__(
-        self,
-        action: str,
-        totalQuantity: Decimal | float | int | str,
-        **kwargs,
-    ):
-        Order.__init__(
-            self,
-            orderType="MKT",
-            action=action,
-            totalQuantity=_toDecimal(totalQuantity),
-            **kwargs,
-        )
-
-
-class StopOrder(Order):
-    def __init__(
-        self,
-        action: str,
-        totalQuantity: Decimal | float | int | str,
-        stopPrice: Decimal | float | int | str,
-        **kwargs,
-    ):
-        Order.__init__(
-            self,
-            orderType="STP",
-            action=action,
-            totalQuantity=_toDecimal(totalQuantity),
-            auxPrice=_toDecimal(stopPrice),
-            **kwargs,
-        )
-
-
-class StopLimitOrder(Order):
-    def __init__(
-        self,
-        action: str,
-        totalQuantity: Decimal | float | int | str,
-        lmtPrice: Decimal | float | int | str,
-        stopPrice: Decimal | float | int | str,
-        **kwargs,
-    ):
-        Order.__init__(
-            self,
-            orderType="STP LMT",
-            action=action,
-            totalQuantity=_toDecimal(totalQuantity),
-            lmtPrice=_toDecimal(lmtPrice),
-            auxPrice=_toDecimal(stopPrice),
-            **kwargs,
-        )
+# TWS API 10.51 reports a completed order's outcome as descriptive text
+# in ``OrderState.completedStatus`` rather than the status names IBKR
+# documents for that field. Each pattern maps one observed phrasing to
+# the terminal status it means; text matching none stays unrecognised so
+# the caller's fallback decides instead of a guess.
+_COMPLETED_STATUS_TEXT: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"Filled Size: \d[\d,]*(?:\.\d+)?"), "Filled"),
+    (re.compile(r"Cancelled by .+", re.DOTALL), "Cancelled"),
+)
 
 
 @dataclass
@@ -376,6 +353,14 @@ class OrderStatus:
     clientId: int = 0
     whyHeld: str = ""
     mktCapPrice: Decimal | None = None
+
+    # One display policy for the whole order plane: the generated repr
+    # printed every unset price as ``None`` and every quantity as
+    # ``Decimal('0.0')``, which buried the two fields a status line is
+    # actually about. ``dataclass`` never overwrites a ``__repr__`` the
+    # class body already defines, so this binding wins.
+    __repr__ = dataclassRepr
+    __str__ = dataclassRepr
 
     @property
     def total(self) -> Decimal | None:
@@ -445,16 +430,30 @@ class OrderStatus:
         ]
     )
 
+    @staticmethod
+    def terminalFromCompleted(status: str) -> str | None:
+        """The terminal status a completed-order replay reports, or None.
+
+        Accepts a plain ``DoneStates`` name as-is and maps the descriptive
+        text TWS 10.51 sends (``"Filled Size: 10"``, ``"Cancelled by
+        Trader"``, ``"Cancelled by System:\\n..."``) to the status it
+        names. Returns None for anything else, including the empty string.
+        """
+        if status in OrderStatus.DoneStates:
+            return status
+        for pattern, terminal in _COMPLETED_STATUS_TEXT:
+            if pattern.fullmatch(status):
+                return terminal
+        return None
+
 
 @dataclass(slots=True, frozen=True)
 class OrderCancel:
     """CME-tagging envelope for cancelOrder + reqGlobalCancel.
 
-    IBKR's reference cancelOrder / reqGlobalCancel take this object
-    rather than scalar arguments so callers can attach the
-    ``manualOrderCancelTime`` (gate 169), ``extOperator`` (gate 192),
-    and ``manualOrderIndicator`` (gate 192) fields the wire protocol
-    grew for CME compliance. ``None`` means unset — the wire encoder
+    Carries the ``manualOrderCancelTime`` (gate 169), ``extOperator``
+    (gate 192), and ``manualOrderIndicator`` (gate 192) fields the wire
+    protocol grew for CME compliance. ``None`` means unset — the wire encoder
     skips the field at send time.
     """
 
@@ -466,7 +465,7 @@ class OrderCancel:
 @dataclass(slots=True, frozen=True)
 class OrderAllocation:
     """Per-account allocation snapshot carried on an ``OrderState``
-    for FA / model orders. Mirrors IBKR's reference shape.
+    for FA / model orders.
     """
 
     account: str = ""
@@ -505,8 +504,8 @@ class OrderState:
     # Monetary fields are ``Decimal | None`` end-to-end so user code
     # treats unset as falsy without the ``Decimal('NaN')`` truthy trap.
     # ``commissionAndFees`` is the IBKR-aligned canonical name in v3.0+;
-    # ``commission`` continues to work via the deprecation alias installed
-    # below (removal target: v4.0).
+    # ``commission`` (below the fields) is its deprecated v2.x name, until
+    # v4.0.
     commissionAndFees: Decimal | None = None
     minCommission: Decimal | None = None
     maxCommission: Decimal | None = None
@@ -517,6 +516,20 @@ class OrderState:
     orderAllocations: list[OrderAllocation] = field(default_factory=list)
     completedTime: str = ""
     completedStatus: str = ""
+    # whatIf previews only: the broker's REFUSAL of the preview, which arrives
+    # as an error reply instead of an openOrder answer (e.g. 201 "Order
+    # rejected - reason:MARGIN CALCULATION IS NOT SUPPORTED FOR THIS
+    # CONTRACT"). A refused preview carries no margin or commission facts.
+    # 0 / "" for every answered preview and every live order state.
+    whatIfErrorCode: int = 0
+    whatIfErrorString: str = ""
+
+    commission: ClassVar[_CommissionAlias[Decimal | None]] = _CommissionAlias()
+
+    @property
+    def whatIfRefused(self) -> bool:
+        """True when the broker refused this whatIf preview (see `whatIfErrorCode`)."""
+        return self.whatIfErrorCode != 0
 
     def transform(self, transformer):
         """Convert the numeric values of this OrderState into a new OrderState transformed by 'using'"""
@@ -572,11 +585,16 @@ class OrderState:
 
                 # else, round to the requested precision
                 return round(floated, precision)
-            except Exception as _:
+            except (TypeError, ValueError):
                 # initial conversion failed so just return None in its place
                 return None
 
-        return self.transform(lambda x: floatOrNone(x, digits))
+        # an OrderStateNumeric, as annotated: transform keeps the class it is
+        # given, and replace() on self would keep OrderState
+        numeric = OrderStateNumeric(
+            **{f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+        )
+        return numeric.transform(lambda x: floatOrNone(x, digits))
 
     def formatted(self, digits: int = 2):
         """Return a new OrderState with the current values as formatted strings."""
@@ -620,18 +638,14 @@ class OrderStateNumeric(OrderState):
     maxCommission: float | None = None  # type: ignore[assignment]
 
 
-# Install legacy ``commission`` deprecation alias on both ``OrderState``
-# and ``OrderStateNumeric``. v2.x callers that read or set
-# ``state.commission`` continue to work but emit ``DeprecationWarning``;
-# the alias is slated for removal in v4.0. The same helper is applied to
-# ``CommissionReport`` in ``objects.py``.
-_install_commission_alias(OrderState)
-_install_commission_alias(OrderStateNumeric)
-
-
 @dataclass
 class OrderComboLeg:
     price: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        # As for Order's Decimal fields: floats and strings coerce, and a
+        # value that is not a finite number is unset.
+        self.price = finiteDecimal(self.price)
 
 
 # Trade is deliberately not @dataclass(slots=True). __post_init__ assigns
@@ -671,6 +685,12 @@ class Trade:
     # ``openOrder`` callback for this trade.
     serverOrder: Order | None = None
 
+    # Same display policy as ``Order`` / ``OrderStatus`` — a Trade printed
+    # on a log line shows its contract, its order, its status and its fills
+    # on ONE line, and nothing that was never set.
+    __repr__ = dataclassRepr
+    __str__ = dataclassRepr
+
     # TODO: replace these with an enum?
     events: ClassVar = (
         "statusEvent",
@@ -683,6 +703,13 @@ class Trade:
     )
 
     def __post_init__(self):
+        # True once a modification of an order TWS has acknowledged is sent,
+        # and it stays True. TWS does not confirm a modification: the status
+        # for an accepted one looks like a repeated status, which TWS often
+        # sends, and it carries no order terms. While True, an error in
+        # ``wrapper._ENDS_UNMODIFIED_ORDER_CODES`` leaves this order live until
+        # TWS reports a status that ends it.
+        self.modifyUnconfirmed: bool = False
         self.statusEvent = Event("statusEvent")
         self.modifyEvent = Event("modifyEvent")
         self.fillEvent = Event("fillEvent")
@@ -829,3 +856,34 @@ class PercentChangeCondition(OrderCondition):
     changePercent: float = 0.0
     conId: int = 0
     exch: str = ""
+
+
+# The type of a scalar Order field.
+OrderScalar: TypeAlias = (
+    type[Decimal] | type[float] | type[int] | type[bool] | type[str]
+)
+
+
+def _scalar(
+    hint: OrderScalar | type[SoftDollarTier] | UnionType | GenericAlias,
+) -> OrderScalar | None:
+    """The scalar type an Order field annotated ``hint`` holds (Decimal,
+    float, int, bool or str), if any."""
+    kinds = get_args(hint) or (hint,)
+    return next((t for t in (Decimal, float, int, bool, str) if t in kinds), None)
+
+
+# The scalar type each scalar Order field holds, by field; resolved here,
+# at the end of the module, once every type the annotations name is
+# defined.
+ORDER_FIELD_TYPES: Mapping[str, OrderScalar] = MappingProxyType(
+    {
+        name: scalar
+        for name, hint in get_type_hints(Order).items()
+        if name in Order.__dataclass_fields__ and (scalar := _scalar(hint)) is not None
+    }
+)
+# The Decimal fields, which Order.__post_init__ coerces.
+_DECIMAL_FIELDS: tuple[str, ...] = tuple(
+    name for name, scalar in ORDER_FIELD_TYPES.items() if scalar is Decimal
+)

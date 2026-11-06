@@ -6,6 +6,8 @@ trade.statusEvent, etc. — otherwise user code blocks forever past
 the daily server-side reset.
 """
 
+from __future__ import annotations
+
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,7 +36,7 @@ def _stock(conId: int) -> ibi.Stock:
 
 async def test_disconnect_fails_inflight_request_futures():
     ib = ibi.IB()
-    req, _ = ib.wrapper.requests.open(SingletonKey("openOrders"))
+    req = ib.wrapper.requests.open(SingletonKey("openOrders"))
     future = req.future
 
     ib.wrapper.connectionClosed()
@@ -45,7 +47,7 @@ async def test_disconnect_fails_inflight_request_futures():
 
 async def test_disconnect_fails_reqid_keyed_request_futures():
     ib = ibi.IB()
-    req, _ = ib.wrapper.requests.open(ReqIdKey(7))
+    req = ib.wrapper.requests.open(ReqIdKey(7))
     future = req.future
     ib.wrapper.connectionClosed()
     with pytest.raises(ConnectionError):

@@ -18,7 +18,7 @@ non-monetary tags), then the happy paths. Covers the v3.0 shifts:
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, is_dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -78,6 +78,33 @@ def test_account_value_non_monetary_tag_returns_none_even_for_numeric_string():
     """``Currency`` is a string tag — never coerce to Decimal."""
     av = AccountValue("DU1", "Currency", "USD", "", "")
     assert av.decimalValue is None
+
+
+def test_account_value_ledger_prefixed_monetary_tag_is_still_monetary():
+    """TWS 10.47+ installs default to prefixing per-currency rows with
+    ``$LEDGER-``; the typed view must not vanish when that's on."""
+    av = AccountValue("DU1", "$LEDGER-AccruedCash", "1000.50", "USD", "")
+    assert av.tag == "$LEDGER-AccruedCash"
+    assert av.decimalValue == Decimal("1000.50")
+
+
+def test_account_value_ledger_prefixed_non_monetary_tag_stays_none():
+    av = AccountValue("DU1", "$LEDGER-Currency", "USD", "USD", "")
+    assert av.decimalValue is None
+
+
+def test_ledger_and_account_level_rows_do_not_collide():
+    """The prefix exists so the per-currency row stops overwriting the
+    account-level row of the same tag and currency."""
+    ib = ibi.IB()
+    ib.wrapper.updateAccountValue("AccruedCash", "1500", "USD", "DU1")
+    ib.wrapper.updateAccountValue("$LEDGER-AccruedCash", "1000", "USD", "DU1")
+
+    values = {av.tag: av.decimalValue for av in ib.accountValues("DU1")}
+    assert values == {
+        "AccruedCash": Decimal(1500),
+        "$LEDGER-AccruedCash": Decimal(1000),
+    }
 
 
 def test_account_value_monetary_tag_garbage_returns_none():
@@ -300,7 +327,6 @@ def test_wrapper_update_portfolio_zero_drops_cached_entry():
 
 
 def test_fill_construction_round_trip():
-    from datetime import datetime
 
     fill = Fill(
         ibi.Stock("AAPL", "SMART", "USD"),

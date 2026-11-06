@@ -6,6 +6,8 @@ Per the IB TWS API spec: bit 0 (mask & 1) is bidPastLow, bit 1 (mask & 2)
 is askPastHigh. Both decoder paths must follow this.
 """
 
+from __future__ import annotations
+
 import ib_async as ibi
 from ib_async._requests import ReqIdKey
 from ib_async.decoder import Decoder
@@ -16,7 +18,7 @@ def _decode_historical_bidask_with_mask(mask: int):
     decoder = Decoder(ib.wrapper, serverVersion=176)
 
     req_id = 11
-    req, _ = ib.wrapper.requests.open(ReqIdKey(req_id))
+    req = ib.wrapper.requests.open(ReqIdKey(req_id))
 
     # Synthetic wire payload: msgId, reqId, n=1, [time, mask, priceBid,
     # priceAsk, sizeBid, sizeAsk] * n, done.
@@ -67,7 +69,7 @@ def test_historical_bidask_matches_live_tickbytick_decoding():
 
     def fake_tick_by_tick_bid_ask(
         reqId, time, bidPrice, askPrice, bidSize, askSize, attrib
-    ):  # noqa: N803
+    ):
         captured["live"] = attrib
 
     ib.wrapper.tickByTickBidAsk = fake_tick_by_tick_bid_ask  # type: ignore[method-assign]

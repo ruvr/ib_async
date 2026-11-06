@@ -1,5 +1,7 @@
 """Utilities."""
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import datetime as dt
@@ -9,76 +11,310 @@ import os
 import signal
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from dataclasses import fields, is_dataclass
-from decimal import Decimal
-from typing import (
-    Any,
-    Final,
-    TypeAlias,
+from collections import Counter
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
 )
-from zoneinfo import ZoneInfo
+from collections.abc import (
+    Set as AbstractSet,
+)
+from dataclasses import Field, fields, is_dataclass
+from decimal import Decimal
+from enum import Enum
+from importlib import import_module
+from types import ModuleType
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Final,
+    Protocol,
+    TypeAlias,
+    runtime_checkable,
+)
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import eventkit as ev
+import nest_asyncio
+from eventkit import Event
+from eventkit.util import get_event_loop as _threadEventLoop
 
-globalErrorEvent = ev.Event()
+
+class Dataclass(Protocol):
+    """Any dataclass instance."""
+
+    __dataclass_fields__: ClassVar[dict[str, Field[FieldValue]]]
+
+
+class _HasDict(Protocol):
+    """An object that stores its values as attributes, such as a FlexReport
+    row."""
+
+    __dict__: dict[str, FieldValue]
+
+
+# An open, high, low or close value of a bar.
+Ohlc: TypeAlias = Decimal | float | None
+
+if TYPE_CHECKING:
+    import pandas as pd
+    import polars as pl
+    from matplotlib.figure import Figure
+
+    from ib_async.depth import DepthBook
+    from ib_async.objects import BarData, RealTimeBar
+
+    # A value that a field of an ib_async dataclass can hold. The alias
+    # refers to itself and to imports made only for type checking. For
+    # that reason it is defined only for the type checker. Annotations are
+    # strings and never evaluate it.
+    FieldValue: TypeAlias = (
+        str
+        | bytes
+        | int
+        | float
+        | bool
+        | Decimal
+        | dt.date
+        | dt.datetime
+        | dt.time
+        | dt.timedelta
+        | Enum
+        | Event
+        | Dataclass
+        | DepthBook
+        | Sequence["FieldValue"]
+        | Mapping[str, "FieldValue"]
+        | None
+    )
+    # One row for :func:`df`. A row is a dataclass, a tuple, a mapping or
+    # an object that stores its values as attributes.
+    Record: TypeAlias = (
+        Dataclass | tuple[FieldValue, ...] | Mapping[str, FieldValue] | _HasDict
+    )
+
+globalErrorEvent: Event = Event()
 """
 Event to emit global exceptions.
 """
 
+
+def checkUnique(what: str, names: Iterable[str]) -> None:
+    """Refuse a name given twice among ``names`` (``what`` they are)."""
+    twice = sorted(name for name, count in Counter(names).items() if count > 1)
+    if twice:
+        raise ValueError(f"{what} given twice: {', '.join(twice)}")
+
+
+def _optional(module: str, needed: str) -> ModuleType:
+    """The optional dependency ``module``, imported when first used;
+    refused with ``needed``, which says what needs it and how to install
+    it."""
+    try:
+        return import_module(module)
+    except ImportError as e:
+        raise ImportError(needed) from e
+
+
 EPOCH: Final = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
 UNSET_INTEGER: Final = 2**31 - 1
 UNSET_DOUBLE: Final = sys.float_info.max
-# IBKR's reference client uses ``UNSET_LONG`` for ``optional int64`` proto
+# ``UNSET_LONG`` is IBKR's unset sentinel for ``optional int64`` proto
 # fields (e.g. ``Order.permId``) and ``UNSET_DECIMAL`` for stringly-encoded
-# Decimal wire fields (e.g. ``Order.totalQuantity``). Mirroring the
-# constants here lets the proto send-side reject these sentinels with the
-# same gate IBKR uses, avoiding the server-side default-fill that turns
-# proto3-absent fields back into the magic sentinel value.
+# Decimal wire fields (e.g. ``Order.totalQuantity``). Defining the
+# constants here lets the proto send-side reject these sentinels,
+# avoiding the server-side default-fill that turns proto3-absent fields
+# back into the magic sentinel value.
 UNSET_LONG: Final = 2**63 - 1
 UNSET_DECIMAL: Final = Decimal(2**127 - 1)
 
 Time_t: TypeAlias = dt.time | dt.datetime
 
 
-def df(objs, labels: list[str] | None = None):
+def df(objs: Iterable[Record], labels: Sequence[str] | None = None) -> pl.DataFrame:
     """
-    Create pandas DataFrame from the sequence of same-type objects.
+    Create a polars DataFrame with one row per object. The objects are of
+    one kind: dataclasses (such as ``BarData``), namedtuples, dicts,
+    attribute records (``FlexReport`` rows) or plain tuples (columns
+    ``column_0``, ``column_1``, ...).
+
+    Values keep their types: ``Decimal`` and ``datetime`` (with its time
+    zone; a fixed offset, as from ``datetime.astimezone()``, as UTC, the
+    same instant) become polars ``Decimal`` and ``Datetime`` columns, ``None``
+    becomes null, and an ib_async object such as a ``Contract`` (or an
+    enum member) is stored as itself. A column of ints and floats both
+    becomes ``Float64`` when every int is exact as a float; any other
+    column polars cannot hold value for value is stored as objects. With
+    no objects the result has no rows.
+
+    Requires polars: ``pip install "ib_async[polars]"``. polars runs on
+    CPython only; on PyPy, :func:`pandasDf` builds a pandas DataFrame.
 
     Args:
-      labels: If supplied, retain only the given labels and drop the rest.
+      labels: If supplied, keep only these columns, in this order.
     """
-    import pandas as pd
+    pl = _optional(
+        "polars",
+        'util.df() requires polars: pip install "ib_async[polars]". '
+        "polars runs on CPython only; on PyPy use util.pandasDf().",
+    )
 
-    from .objects import DynamicObject
+    columns, data = _table(objs)
+    if not data:
+        return pl.DataFrame(schema=list(labels or ()))
+    frame = pl.DataFrame(
+        [
+            _series(pl, name, values)
+            for name, values in zip(
+                columns,
+                (list(column) for column in zip(*data, strict=True)),
+                strict=True,
+            )
+        ]
+    )
+    return frame.select(labels) if labels else frame
 
-    if objs:
-        objs = list(objs)
-        obj = objs[0]
-        if is_dataclass(obj):
-            df = pd.DataFrame.from_records(dataclassAsTuple(o) for o in objs)
-            df.columns = [field.name for field in fields(obj)]
-        elif isinstance(obj, DynamicObject):
-            df = pd.DataFrame.from_records(o.__dict__ for o in objs)
-        else:
-            df = pd.DataFrame.from_records(objs)
 
-        if isinstance(obj, tuple):
-            _fields = getattr(obj, "_fields", None)
-            if _fields:
-                # assume it's a namedtuple
-                df.columns = _fields
+# pandas is not a dependency, not even for the docs. The return type
+# resolves only when pandas is installed where the types are checked.
+def pandasDf(
+    objs: Iterable[Record], labels: Sequence[str] | None = None
+) -> pd.DataFrame:
+    """
+    Same as :func:`df`, but returns a ``pandas.DataFrame``, for where polars
+    is not available (PyPy). pandas infers each column's type itself:
+    ``Decimal`` values stay ``Decimal`` (an object column), but a numeric
+    column with a ``None`` becomes float (``NaN`` for the ``None``) and an
+    aware ``datetime`` a pandas ``Timestamp``. pandas is not a dependency
+    of ib_async: install it yourself.
+
+    Args:
+      labels: If supplied, keep only these columns, in this order.
+    """
+    pd = _optional(
+        "pandas",
+        "util.pandasDf() requires pandas, which ib_async does not install: "
+        "pip install pandas",
+    )
+
+    columns, data = _table(objs)
+    if not data:
+        return pd.DataFrame(columns=list(labels or ()))
+    frame = pd.DataFrame.from_records(data, columns=columns)
+    return frame[list(labels)] if labels else frame
+
+
+def _table(objs: Iterable[Record]) -> tuple[list[str], list[tuple[FieldValue, ...]]]:
+    """Return the column names and one tuple of values per object, for
+    :func:`df`. All objects are treated as the same kind as the first."""
+    rows = list(objs)
+    if not rows:
+        return [], []
+    first = rows[0]
+    if is_dataclass(first):
+        return [field.name for field in fields(first)], [
+            dataclassAsTuple(o)
+            for o in rows
+            if is_dataclass(o) and not isinstance(o, type)
+        ]
+    if isinstance(first, tuple):
+        columns = list(getattr(first, "_fields", ())) or [
+            f"column_{i}" for i in range(len(first))
+        ]
+        return columns, [row for row in rows if isinstance(row, tuple)]
+    records: list[Mapping[str, FieldValue]]
+    if isinstance(first, Mapping):
+        records = [row for row in rows if isinstance(row, Mapping)]
     else:
-        df = None
-
-    if labels:
-        exclude = [label for label in df if label not in labels]
-        df = df.drop(exclude, axis=1)
-
-    return df
+        records = [vars(o) for o in rows]
+    # every key of every record, in first-seen order; a missing one is null
+    columns = list(dict.fromkeys(key for record in records for key in record))
+    return columns, [tuple(record.get(c) for c in columns) for record in records]
 
 
-def dataclassAsDict(obj) -> dict:
+# Values polars stores in a column of their own type; anything else
+# (a Contract, a list of TagValues) is kept as the Python object.
+# The exact types polars holds as they are (a subclass, such as an enum
+# member, it would convert to its base type).
+_POLARS_SCALARS: Final = frozenset(
+    {bool, int, float, str, bytes, Decimal, dt.date, dt.datetime, dt.time, dt.timedelta}
+)
+
+
+# The kind of a column of ints and floats both (FlexReport numbers),
+# which polars holds as Float64: only when every int is one a float holds
+# exactly.
+_NUMBER = "number"
+_FLOAT_EXACT_INT = 2**53
+# The most digits a polars Decimal column holds, whole and fractional
+# together: a value needing more is stored as null.
+_POLARS_DECIMAL_DIGITS = 38
+
+
+def _columnKind(values: list[FieldValue]) -> type | str | None:
+    """The one kind of the column's values polars holds as a typed column
+    without changing any: a scalar type of its own (ints and floats
+    together are numbers, while every int is exact as a float), with no
+    non-finite Decimal (polars has none) and datetimes in one time zone at
+    most (a column has one). None for any other column, which is kept as
+    objects, values as they are."""
+    kinds: set[type | str] = set()
+    zones = set()
+    largestInt = 0
+    # The most whole and fractional digits of the column's Decimals, which
+    # its one precision and scale must hold together.
+    whole = fraction = 0
+    for value in values:
+        if value is None:
+            continue
+        if type(value) not in _POLARS_SCALARS:
+            return None
+        if isinstance(value, dt.time) and value.tzinfo is not None:
+            return None  # a polars Time has no zone
+        if isinstance(value, Decimal):
+            if not value.is_finite():
+                return None
+            _, digits, exponent = value.as_tuple()
+            assert isinstance(exponent, int)  # noqa: S101 - finite, so an int
+            whole = max(whole, len(digits) + exponent)
+            fraction = max(fraction, -exponent)
+        if isinstance(value, dt.datetime):
+            # polars stores every fixed offset (datetime.timezone) as UTC
+            fixed = isinstance(value.tzinfo, dt.timezone)
+            zones.add("UTC" if fixed else str(value.tzinfo))
+        if isinstance(value, int) and not isinstance(value, bool):
+            largestInt = max(largestInt, abs(value))
+        kinds.add(type(value))
+    if kinds == {int, float}:
+        return _NUMBER if largestInt <= _FLOAT_EXACT_INT else None
+    if len(kinds) > 1 or len(zones) > 1 or whole + fraction > _POLARS_DECIMAL_DIGITS:
+        return None
+    return next(iter(kinds), _NUMBER)
+
+
+def _series(polars: ModuleType, name: str, values: list[FieldValue]) -> pl.Series:
+    """The polars Series of a df column: typed when polars holds every
+    value as it is (see :func:`_columnKind`), else objects."""
+    kind = _columnKind(values)
+    if kind is not None:
+        try:
+            # Only ints beside floats convert, to Float64 (exactly); any
+            # other value polars cannot hold as it is (an int past its
+            # widest integer type) fails, and the column is objects.
+            return polars.Series(name, values, strict=kind != _NUMBER)
+        except (polars.exceptions.PolarsError, TypeError, ValueError, OverflowError):
+            pass
+    # polars converts an enum member it meets first to its value even in an
+    # object column; a plain object ahead of the values, dropped after,
+    # keeps every value as it is.
+    return polars.Series(name, [object(), *values], dtype=polars.Object).slice(1)
+
+
+def dataclassAsDict(obj: Dataclass) -> dict[str, FieldValue]:
     """
     Return dataclass values as ``dict``.
     This is a non-recursive variant of ``dataclasses.asdict``.
@@ -89,7 +325,7 @@ def dataclassAsDict(obj) -> dict:
     return {field.name: getattr(obj, field.name) for field in fields(obj)}
 
 
-def dataclassAsTuple(obj) -> tuple[Any, ...]:
+def dataclassAsTuple(obj: Dataclass) -> tuple[FieldValue, ...]:
     """
     Return dataclass values as ``tuple``.
     This is a non-recursive variant of ``dataclasses.astuple``.
@@ -100,7 +336,7 @@ def dataclassAsTuple(obj) -> tuple[Any, ...]:
     return tuple(getattr(obj, field.name) for field in fields(obj))
 
 
-def dataclassNonDefaults(obj) -> dict[str, Any]:
+def dataclassNonDefaults(obj: Dataclass) -> dict[str, FieldValue]:
     """
     For a ``dataclass`` instance get the fields that are different from the
     default values and return as ``dict``.
@@ -112,10 +348,10 @@ def dataclassNonDefaults(obj) -> dict[str, Any]:
 
     return {
         field.name: value
-        for field, value in zip(fields(obj), values)
+        for field, value in zip(fields(obj), values, strict=True)
         if value is not None
         and value != field.default
-        and value == value
+        and not isNan(value)
         and not (
             (isinstance(value, list) and value == [])
             or (isinstance(value, dict) and value == {})
@@ -123,30 +359,156 @@ def dataclassNonDefaults(obj) -> dict[str, Any]:
     }
 
 
-def dataclassUpdate(obj, *srcObjs, **kwargs) -> object:
+# ONE display-repr policy for every order-plane object lives below:
+# ``DISPLAY_KEEP_ZERO_FIELDS`` + ``DISPLAY_BOILERPLATE_STRINGS`` +
+# ``dataclassDisplayFields`` + ``dataclassDisplayValue`` +
+# ``dataclassDisplayPairs``, consumed by ``dataclassRepr`` and by the
+# hand-written ``__repr__`` of ``Order`` / ``Contract`` / ``Forex``. It is
+# a DISPLAY policy only: ``dataclassAsDict`` / ``dataclassAsTuple`` /
+# ``dataclassNonDefaults`` keep their own semantics for the callers that
+# round-trip data rather than show it.
+
+# Fields where a ZERO value is information, not absence, so display keeps
+# it. Two families:
+#   * identity — ``orderId`` 0 is TWS's own manual-order id, and a 0
+#     ``permId`` / ``parentId`` / ``clientId`` / ``conId`` / ``reqId`` is a
+#     real record key the reader needs in order to match a log line
+#     against a broker callback;
+#   * quantity — a 0 ``filled`` / ``remaining`` / ``totalQuantity`` /
+#     ``shares`` / ``cumQty`` is a definite answer ("nothing filled"), not
+#     an unset field.
+# Every OTHER numeric field that is zero says nothing a reader can use, so
+# it is dropped (a 0 price, a 0 offset, a 0 percentage, a 0 count).
+DISPLAY_KEEP_ZERO_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "orderId",
+        "permId",
+        "parentId",
+        "clientId",
+        "conId",
+        "reqId",
+        "filled",
+        "remaining",
+        "totalQuantity",
+        "shares",
+        "cumQty",
+    }
+)
+
+# String values IBKR sends to mean "not applicable". They are not empty, so
+# the empty-string rule cannot catch them, and they are not the dataclass
+# default, so the default rule cannot either — yet every one of them is
+# boilerplate that carries no information about the order.
+#   * ``'None'`` — ``Order.adjustedOrderType`` on an ``openOrder`` decode
+#     (``decoder.py`` ``o.adjustedOrderType``): IBKR writes the literal
+#     four-character string ``None`` when the order has no adjusted-stop
+#     companion.
+#   * ``'Not an insider or substantial shareholder'`` —
+#     ``Order.shareholder`` (``decoder.py`` ``o.shareholder``): the
+#     regulatory disclosure IBKR stamps on every non-insider order, i.e.
+#     on effectively every order.
+#   * ``'?'`` — TWS's unknown-string placeholder on an ``openOrder``
+#     snapshot. ``Wrapper.openOrder`` already strips it when building
+#     ``Trade.serverOrder``; display drops it wherever else it survives.
+DISPLAY_BOILERPLATE_STRINGS: Final[frozenset[str]] = frozenset(
+    {
+        "None",
+        "Not an insider or substantial shareholder",
+        "?",
+    }
+)
+
+
+def _carriesDisplayInformation(
+    name: str, value: FieldValue, default: FieldValue
+) -> bool:
+    """Whether one field's value tells a reader something.
+
+    The single predicate behind :func:`dataclassDisplayFields`; see the
+    constants above for the two named exception sets.
     """
-    Update fields of the given ``dataclass`` object from zero or more
-    ``dataclass`` source objects and/or from keyword arguments.
+
+    # Unset, at its declared default, or NaN: nothing was said.
+    # (A field declared with ``default_factory`` has ``default`` set to the
+    # ``MISSING`` sentinel, which never equals a value, so such fields fall
+    # through to the emptiness rules below.)
+    if value is None or value == default or isNan(value):
+        return False
+
+    # Empty container / empty string: something was said, but it is blank.
+    if isinstance(value, list | dict | str) and not value:
+        return False
+
+    if isinstance(value, str):
+        return value not in DISPLAY_BOILERPLATE_STRINGS
+
+    # Numeric zero is absence for everything but the identity and quantity
+    # fields named above. ``bool`` is an ``int`` subclass, and ``False == 0``,
+    # so flags are excluded here — a flag that differs from its default is
+    # always information.
+    if isinstance(value, Decimal | float | int) and not isinstance(value, bool):
+        return bool(value) or name in DISPLAY_KEEP_ZERO_FIELDS
+
+    return True
+
+
+def dataclassDisplayFields(obj: Dataclass) -> dict[str, FieldValue]:
+    """
+    For a ``dataclass`` instance get the fields worth SHOWING a human, in
+    declaration order, and return as ``dict``.
+
+    A field is kept only when it carries information: unset (``None``),
+    at its declared default, ``NaN``, an empty list / dict / string, an
+    IBKR "not applicable" string sentinel
+    (:data:`DISPLAY_BOILERPLATE_STRINGS`) and numeric zero outside the
+    identity / quantity fields (:data:`DISPLAY_KEEP_ZERO_FIELDS`) are all
+    dropped.
+
+    This is the one policy every order-plane repr uses, so a log line of a
+    ``Trade``, an ``Order``, an ``OrderStatus``, an ``Execution``, a
+    ``Fill``, a ``CommissionReport`` or a ``Contract`` shows the same
+    shape: only what the broker actually said.
     """
     if not is_dataclass(obj):
         raise TypeError(f"Object {obj} is not a dataclass")
 
-    for srcObj in srcObjs:
-        obj.__dict__.update(dataclassAsDict(srcObj))  # type: ignore[union-attr]
+    return {
+        field.name: value
+        for field, value in ((field, getattr(obj, field.name)) for field in fields(obj))
+        if _carriesDisplayInformation(field.name, value, field.default)
+    }
 
-    obj.__dict__.update(**kwargs)  # type: ignore[union-attr]
-    return obj
+
+def dataclassDisplayValue(value: FieldValue) -> str:
+    """Render one field value for display.
+
+    ``Decimal`` prints as its plain numeric string (``29403.25``, ``1``)
+    rather than ``Decimal('29403.25')`` — the wrapper is noise in a log
+    line, and every quantity and price on the order plane is a
+    ``Decimal``. Everything else prints through ``repr``, so a nested
+    dataclass renders through its OWN culled repr.
+    """
+
+    if isinstance(value, Decimal):
+        return str(value)
+
+    return repr(value)
 
 
-def dataclassRepr(obj) -> str:
+def dataclassDisplayPairs(attrs: dict[str, FieldValue]) -> str:
+    """Render display fields as the ``name=value, name=value`` repr body."""
+
+    return ", ".join(f"{k}={dataclassDisplayValue(v)}" for k, v in attrs.items())
+
+
+def dataclassRepr(obj: Dataclass) -> str:
     """
     Provide a culled representation of the given ``dataclass`` instance,
-    showing only the fields with a non-default value.
+    showing only the fields that carry information under
+    :func:`dataclassDisplayFields`.
     """
-    attrs = dataclassNonDefaults(obj)
     clsName = obj.__class__.__qualname__
-    kwargs = ", ".join(f"{k}={v!r}" for k, v in attrs.items())
-    return f"{clsName}({kwargs})"
+    return f"{clsName}({dataclassDisplayPairs(dataclassDisplayFields(obj))})"
 
 
 def isnamedtupleinstance(x):
@@ -163,7 +525,13 @@ def isnamedtupleinstance(x):
     return all(isinstance(n, str) for n in f)
 
 
-def tree(obj):
+# The values that :func:`tree` returns. JSON can hold all of them.
+TreeValue: TypeAlias = (
+    bool | int | float | str | bytes | list["TreeValue"] | dict[str, "TreeValue"]
+)
+
+
+def tree(obj: FieldValue | AbstractSet[FieldValue]) -> TreeValue:
     """
     Convert object to a tree of lists, dicts and simple values.
     The result can be serialized to JSON.
@@ -174,43 +542,97 @@ def tree(obj):
     if isinstance(obj, dt.date | dt.time):
         return obj.isoformat()
 
-    if isinstance(obj, dict):
+    if isinstance(obj, Mapping):
         return {k: tree(v) for k, v in obj.items()}
 
     if isnamedtupleinstance(obj):
-        return {f: tree(getattr(obj, f)) for f in obj._fields}
+        names: tuple[str, ...] = getattr(obj, "_fields")
+        return {f: tree(getattr(obj, f)) for f in names}
 
-    if isinstance(obj, list | tuple | set):
+    if isinstance(obj, list | tuple | set | frozenset):
         return [tree(i) for i in obj]
 
-    if is_dataclass(obj):
+    if is_dataclass(obj) and not isinstance(obj, type):
         return {obj.__class__.__qualname__: tree(dataclassNonDefaults(obj))}
 
     return str(obj)
 
 
-def barplot(bars, title="", upColor="blue", downColor="red"):
+OhlcRow: TypeAlias = tuple[Ohlc, Ohlc, Ohlc, Ohlc]
+
+
+@runtime_checkable
+class _PandasBars(Protocol):
+    """The methods of a pandas DataFrame of bars that :func:`barplot`
+    uses."""
+
+    def __getitem__(self, columns: list[str]) -> _PandasBars: ...
+    def itertuples(self, index: bool, name: None) -> Iterable[OhlcRow]: ...
+
+
+@runtime_checkable
+class _PolarsBars(Protocol):
+    """The methods of a polars DataFrame of bars that :func:`barplot`
+    uses."""
+
+    def select(self, *columns: str) -> _PolarsBars: ...
+    def rows(self) -> list[OhlcRow]: ...
+
+
+if TYPE_CHECKING:
+    # Bars to plot. These are a pandas or polars DataFrame of bars, or bar
+    # objects.
+    Bars: TypeAlias = _PandasBars | _PolarsBars | Iterable[BarData | RealTimeBar]
+
+
+def _plottedPrice(value: Ohlc, bar: int) -> float:
+    """Return a bar's price as a float for plotting. Raise ``ValueError``
+    if the bar has no price, because such a bar cannot be drawn."""
+    if value is None:
+        raise ValueError(f"bar {bar} has no price to plot")
+    return float(value)
+
+
+def _ohlcRows(bars: Bars) -> list[OhlcRow]:
+    """
+    ``(open, high, low, close)`` per bar, from a polars DataFrame (from
+    :func:`df`), a pandas DataFrame (from :func:`pandasDf`) or bar objects
+    (``BarData``, ``RealTimeBar``).
+    """
+    # pandas first: a polars DataFrame has no itertuples, but a pandas one
+    # may have a select
+    if isinstance(bars, _PandasBars):
+        ohlc = bars[["open", "high", "low", "close"]]
+        return list(ohlc.itertuples(index=False, name=None))
+    if isinstance(bars, _PolarsBars):
+        return bars.select("open", "high", "low", "close").rows()
+    return [(b.open, b.high, b.low, b.close) for b in bars]
+
+
+def barplot(
+    bars: Bars, title: str = "", upColor: str = "blue", downColor: str = "red"
+) -> Figure:
     """
     Create candlestick plot for the given bars. The bars can be given as
-    a DataFrame or as a list of bar objects.
+    a DataFrame (from :func:`df` or :func:`pandasDf`) or as a list of bar
+    objects.
     """
-    import matplotlib.pyplot as plt
-    import pandas as pd
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Rectangle
+    needed = (
+        "util.barplot() requires matplotlib, which ib_async does not install: "
+        "pip install matplotlib"
+    )
+    plt = _optional("matplotlib.pyplot", needed)
+    Line2D = _optional("matplotlib.lines", needed).Line2D
+    Rectangle = _optional("matplotlib.patches", needed).Rectangle
 
-    if isinstance(bars, pd.DataFrame):
-        ohlcTups = [tuple(v) for v in bars[["open", "high", "low", "close"]].values]
-    elif bars and hasattr(bars[0], "open_"):
-        ohlcTups = [(b.open_, b.high, b.low, b.close) for b in bars]
-    else:
-        ohlcTups = [(b.open, b.high, b.low, b.close) for b in bars]
+    ohlcTups = _ohlcRows(bars)
 
     fig, ax = plt.subplots()
     ax.set_title(title)
     ax.grid(True)
     fig.set_size_inches(10, 6)
-    for n, (open_, high, low, close) in enumerate(ohlcTups):
+    for n, row in enumerate(ohlcTups):
+        open_, high, low, close = (_plottedPrice(v, n) for v in row)
         if close >= open_:
             color = upColor
             bodyHi, bodyLo = close, open_
@@ -293,7 +715,9 @@ def logToFile(path, level=logging.INFO, fmt=None):
         fmt: Optional ``logging`` format string; defaults to the shared
             ib_async format.
     """
-    target = os.path.abspath(path)
+    # Normalized exactly as logging.FileHandler normalizes baseFilename
+    # (Path.resolve() would also follow symlinks and never match).
+    target = os.path.abspath(path)  # noqa: PTH100
     if _existingHandler(
         lambda h: type(h) is logging.FileHandler and h.baseFilename == target
     ):
@@ -324,9 +748,10 @@ def logToConsole(level=logging.INFO, fmt=None):
     _attachHandler(logging.StreamHandler(), level, fmt)
 
 
-def isNan(x: float) -> bool:
-    """Not a number test."""
-    return x != x
+def isNan(x: FieldValue) -> bool:
+    """Not-a-number test for any value: True for float and Decimal NaN,
+    False for everything else (never raises, unlike ``math.isnan``)."""
+    return x != x  # noqa: PLR0124 - NaN is the only value unequal to itself
 
 
 def formatSI(n: float) -> str:
@@ -341,8 +766,9 @@ def formatSI(n: float) -> str:
     elif n < 1e-22:
         s = "0.00 "
     else:
-        assert n < 9.99e26
-        log = int(math.floor(math.log10(n)))
+        if n >= 9.99e26:
+            raise ValueError(f"{n} is too large for an SI prefix")
+        log = math.floor(math.log10(n))
         i, j = divmod(log, 3)
         for _try in range(2):
             templ = f"%.{2 - j}f"
@@ -405,14 +831,21 @@ def run(*awaitables: Awaitable, timeout: float | None = None):
         # Pass loop explicitly to avoid deprecation warnings in Python 3.10+
         task = asyncio.ensure_future(future, loop=loop)
 
-        def onError(_):
+        # The global error raised while *this* run was active, if any; the
+        # event's last value may be from an earlier, unrelated run.
+        raised: list[BaseException] = []
+
+        def onError(error):
+            raised.append(error)
             task.cancel()
 
         globalErrorEvent.connect(onError)
         try:
             result = loop.run_until_complete(task)
         except asyncio.CancelledError as e:
-            raise globalErrorEvent.value() or e
+            if not raised:
+                raise
+            raise raised[0] from e
         finally:
             globalErrorEvent.disconnect(onError)
 
@@ -471,7 +904,8 @@ def timeRange(start: Time_t, end: Time_t, step: float) -> Iterator[dt.datetime]:
             or as datetime.time in which case today is used as the date
         step (float): The number of seconds of each period
     """
-    assert step > 0
+    if step <= 0:
+        raise ValueError(f"step must be positive, got {step}")
     delta = dt.timedelta(seconds=step)
     t = _fillDate(start)
     tz = dt.UTC if t.tzinfo else None
@@ -503,7 +937,8 @@ async def timeRangeAsync(
     start: Time_t, end: Time_t, step: float
 ) -> AsyncIterator[dt.datetime]:
     """Async version of :meth:`timeRange`."""
-    assert step > 0
+    if step <= 0:
+        raise ValueError(f"step must be positive, got {step}")
 
     delta = dt.timedelta(seconds=step)
     t = _fillDate(start)
@@ -529,56 +964,55 @@ async def waitUntilAsync(t: Time_t) -> bool:
 
 def patchAsyncio():
     """Patch asyncio to allow nested event loops."""
-    import nest_asyncio
-
     nest_asyncio.apply()
 
 
-def getLoop():
+def getLoop() -> asyncio.AbstractEventLoop:
     """
-    Get asyncio event loop with smart fallback handling.
+    Get the event loop for the calling thread.
 
-    This function is designed for use in synchronous contexts or when the
-    execution context is unknown. It will:
-    1. Try to get the currently running event loop (if in async context)
-    2. Fall back to getting the current thread's event loop via policy
-    3. Create a new event loop if none exists or if the existing one is closed
+    In order of preference:
 
-    For performance-critical async code paths, prefer using
-    asyncio.get_running_loop() directly instead of this function.
+    1. the running loop;
+    2. the loop set for this thread with ``asyncio.set_event_loop``, so an
+       application's own loop is always the one used;
+    3. otherwise a new loop, which is set for this thread.
 
-    Note: This function does NOT cache the loop to avoid stale loop bugs
-    when loops are closed and recreated (e.g., in testing, Jupyter notebooks).
+    A closed loop is replaced the same way as a missing one, and the loop
+    is never cached across calls. No deprecated asyncio API is used and no
+    DeprecationWarning is emitted on any supported Python version.
+
+    This is eventkit's rule for the loop of a thread, shared so ib_async
+    and eventkit always agree on it. In a coroutine,
+    ``asyncio.get_running_loop()`` returns the same loop more cheaply.
     """
-    try:
-        # Fast path: we're in an async context (coroutine or callback)
-        loop = asyncio.get_running_loop()
-        return loop
-    except RuntimeError:
-        pass
-
-    # We're in a sync context or no loop is running
-    # Use the event loop policy to get the loop for this thread
-    # This avoids deprecation warnings from get_event_loop() in Python 3.10+
-    try:
-        loop = asyncio.get_event_loop_policy().get_event_loop()
-    except RuntimeError:
-        # No event loop exists for this thread, create one
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop
-
-    # Check if the loop we got is closed - if so, create a new one
-    if loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    return loop
+    return _threadEventLoop()
 
 
 def startLoop():
     """Use nested asyncio event loop for Jupyter notebooks."""
     patchAsyncio()
+
+
+class _QtSignal(Protocol):
+    def connect(self, slot: Callable[[], None]) -> None: ...
+
+
+class _QtTimer(Protocol):
+    """The members of a Qt timer that :func:`useQt` uses."""
+
+    timeout: _QtSignal
+
+    def start(self, msec: int) -> None: ...
+    def stop(self) -> None: ...
+
+
+class _QtEventLoop(Protocol):
+    """The methods of a Qt event loop that :func:`useQt` uses."""
+
+    def quit(self) -> None: ...
+    def exec(self) -> int: ...
+    def exec_(self) -> int: ...
 
 
 def useQt(qtLib: str = "PyQt5", period: float = 0.01):
@@ -604,23 +1038,26 @@ def useQt(qtLib: str = "PyQt5", period: float = 0.01):
             stack.append((qloop, timer))
         qloop, timer = stack.pop()
         timer.start(0)
-        qloop.exec() if qtLib == "PyQt6" else qloop.exec_()
+        # Qt 6 names it exec(); exec_() is the Qt 5 name, deprecated in PySide6
+        qloop.exec() if qtLib in ("PyQt6", "PySide6") else qloop.exec_()
         timer.stop()
         stack.append((qloop, timer))
         qApp.processEvents()  # type: ignore[name-defined]
 
     if qtLib not in {"PyQt5", "PyQt6", "PySide2", "PySide6"}:
         raise RuntimeError(f"Unknown Qt library: {qtLib}")
-    from importlib import import_module
-
-    qc = import_module(qtLib + ".QtCore")
-    qw = import_module(qtLib + ".QtWidgets")
+    needed = (
+        f"util.useQt() with {qtLib} requires {qtLib}, which ib_async does not "
+        f"install: pip install {qtLib}"
+    )
+    qc = _optional(qtLib + ".QtCore", needed)
+    qw = _optional(qtLib + ".QtWidgets", needed)
     global qApp
     qApp = (  # type: ignore[name-defined]
         qw.QApplication.instance() or qw.QApplication(sys.argv)
     )
     loop = getLoop()
-    stack: list = []
+    stack: list[tuple[_QtEventLoop, _QtTimer]] = []
     qt_step()
 
 
@@ -641,8 +1078,159 @@ def formatIBDatetime(t: dt.date | dt.datetime | str | None) -> str:
     return s
 
 
-def parseIBDatetime(s: str) -> dt.date | dt.datetime:
-    """Parse string in IB date or datetime format to datetime."""
+# ``formatDate=3`` values carry no year, so the month/day/time half is
+# parsed against a leap year and re-stamped once the year is known; 2000
+# keeps 02/29 parseable.
+_SHORT_DATETIME_YEAR: Final = 2000
+
+
+def isIBShortDatetime(s: str) -> bool:
+    """Return True when ``s`` is an IB ``formatDate=3`` timestamp.
+
+    ``reqHistoricalData(formatDate=3)`` ships bar timestamps as
+    ``MMdd HH:MM:SS <tz>`` -- the year is simply absent from the wire, so
+    such a value cannot become a ``datetime`` on its own. Callers detect
+    it with this predicate and resolve a whole ascending run at once with
+    :func:`parseIBShortDatetimes`, or hand the year to
+    :func:`parseIBDatetime`.
+    """
+    return (
+        len(s) != 8
+        and not s.isdigit()
+        and s.count(" ") >= 2
+        and "  " not in s
+        and len(s.split(" ", 1)[0]) == 4
+    )
+
+
+def _ibZone(name: str, s: str) -> ZoneInfo:
+    """Return the time zone named in an IB datetime.
+
+    Raises ValueError if this host does not know the zone, as for any
+    other unparseable part of the string."""
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise ValueError(f"unknown time zone {name!r} in IB datetime {s!r}") from e
+
+
+def _splitIBShortDatetime(s: str) -> tuple[dt.datetime, ZoneInfo]:
+    """Split ``MMdd HH:MM:SS <tz>`` into a year-less stamp and its zone."""
+    s0, s1, s2 = s.split(" ", 2)
+    naive = dt.datetime.strptime(f"{_SHORT_DATETIME_YEAR}{s0}{s1}", "%Y%m%d%H:%M:%S")
+    return naive, _ibZone(s2, s)
+
+
+def _stampIBYear(naive: dt.datetime, tz: ZoneInfo, year: int) -> dt.datetime | None:
+    """Move ``naive`` to ``year`` in ``tz``, or None when that date does
+    not exist (02/29 outside a leap year)."""
+    try:
+        return naive.replace(year=year, tzinfo=tz)
+    except ValueError:
+        return None
+
+
+def _nearestIBYear(
+    part: tuple[dt.datetime, ZoneInfo], anchor: dt.datetime
+) -> dt.datetime:
+    """Stamp ``part`` with the year that lands it closest to ``anchor``."""
+    naive, tz = part
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=tz)
+
+    best: dt.datetime | None = None
+    for year in range(anchor.year - 2, anchor.year + 3):
+        candidate = _stampIBYear(naive, tz, year)
+        if candidate is None:
+            continue
+        if best is None or abs(candidate - anchor) < abs(best - anchor):
+            best = candidate
+
+    if best is None:
+        raise ValueError(f"Cannot place IB short datetime near {anchor!r}")
+
+    return best
+
+
+def _stepIBYear(
+    part: tuple[dt.datetime, ZoneInfo], neighbour: dt.datetime, ascending: bool
+) -> dt.datetime:
+    """Stamp ``part`` with the nearest year that keeps the run monotonic:
+    at or after ``neighbour`` when ascending, at or before it otherwise."""
+    naive, tz = part
+    step = 1 if ascending else -1
+    for offset in range(8):
+        candidate = _stampIBYear(naive, tz, neighbour.year + step * offset)
+        if candidate is None:
+            continue
+        if (candidate >= neighbour) if ascending else (candidate <= neighbour):
+            return candidate
+
+    raise ValueError(f"Cannot order IB short datetime against {neighbour!r}")
+
+
+def parseIBShortDatetimes(
+    values: list[str],
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> list[dt.datetime]:
+    """Resolve an ascending run of IB ``formatDate=3`` timestamps.
+
+    A lone ``formatDate=3`` value is ambiguous because the year never
+    reaches the wire, but a *run* is not: IB emits historical bars in
+    ascending order, so anchoring one edge fixes every element. ``start``
+    anchors the first value and the run is walked forwards, rolling the
+    year over whenever ``MMdd`` wraps past new year; otherwise ``end``
+    (defaulting to now) anchors the last value and the run is walked
+    backwards.
+
+    An anchor only has to sit within six months of the edge it anchors,
+    which the response bounds IB reports for a historical request always
+    do.
+    """
+    parts = [_splitIBShortDatetime(v) for v in values]
+    if not parts:
+        return []
+
+    if start is not None:
+        out = [_nearestIBYear(parts[0], start)]
+        for part in parts[1:]:
+            out.append(_stepIBYear(part, out[-1], ascending=True))
+        return out
+
+    if end is None:
+        end = dt.datetime.now(parts[-1][1])
+
+    out = [_nearestIBYear(parts[-1], end)]
+    for part in reversed(parts[:-1]):
+        out.append(_stepIBYear(part, out[-1], ascending=False))
+    out.reverse()
+    return out
+
+
+def splitIBLastTradeDate(value: str) -> list[str]:
+    """A contract's ``lastTradeDateOrContractMonth`` wire value as
+    ``[date, time, zone]``, as many as it has.
+
+    A whitespace-separated value (``20250331 19:30:00 GB-Eire``) splits on
+    whitespace only, since a zone name can contain ``-``; otherwise the
+    hyphenated form (``20260619-15:00:00``, optionally ``-zone``) splits on
+    ``-``.
+    """
+    if any(c.isspace() for c in value):
+        return value.split(None, 2)
+    return value.split("-", 2)
+
+
+def parseIBDatetime(s: str, *, year: int | None = None) -> dt.date | dt.datetime:
+    """Parse string in IB date or datetime format to datetime.
+
+    ``year`` supplies the year for an IB ``formatDate=3`` value
+    (``MMdd HH:MM:SS <tz>``), which carries none of its own; such a value
+    raises without it. :func:`parseIBShortDatetimes` recovers the year
+    from a whole response instead.
+    """
     if len(s) == 8:
         # YYYYmmdd
         y = int(s[0:4])
@@ -650,12 +1238,32 @@ def parseIBDatetime(s: str) -> dt.date | dt.datetime:
         d = int(s[6:8])
         t = dt.date(y, m, d)
     elif s.isdigit():
-        t = dt.datetime.fromtimestamp(int(s), dt.UTC)
+        try:
+            t = dt.datetime.fromtimestamp(int(s), dt.UTC)
+        except (OverflowError, OSError) as e:  # outside datetime's range
+            raise ValueError(f"IB timestamp {s!r} is out of range") from e
+    elif len(s) == 17 and s[8] == "-":
+        # 20260824-20:00:12: IBKR's zone-less form is UTC.
+        t = dt.datetime.strptime(s, "%Y%m%d-%H:%M:%S").replace(tzinfo=dt.UTC)
     elif s.count(" ") >= 2 and "  " not in s:
         # 20221125 10:00:00 Europe/Amsterdam
         s0, s1, s2 = s.split(" ", 2)
-        t = dt.datetime.strptime(s0 + s1, "%Y%m%d%H:%M:%S")
-        t = t.replace(tzinfo=ZoneInfo(s2))
+        if len(s0) == 4:
+            # 1125 10:00:00 Europe/Amsterdam -- formatDate=3, no year.
+            if year is None:
+                raise ValueError(
+                    f"IB formatDate=3 timestamp {s!r} carries no year; pass"
+                    " year=... or resolve the response with"
+                    " parseIBShortDatetimes()"
+                )
+            naive, tz = _splitIBShortDatetime(s)
+            stamped = _stampIBYear(naive, tz, year)
+            if stamped is None:
+                raise ValueError(f"IB datetime {s!r} does not exist in {year}")
+            t = stamped
+        else:
+            t = dt.datetime.strptime(s0 + s1, "%Y%m%d%H:%M:%S")
+            t = t.replace(tzinfo=_ibZone(s2, s))
     else:
         # YYYYmmdd  HH:MM:SS
         # or
