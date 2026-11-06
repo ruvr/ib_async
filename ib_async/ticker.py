@@ -532,6 +532,48 @@ class Tickfilter(Op):
         return VolumeBars(volume, self, maxBars)
 
 
+    def valuebars(
+        self, dollar_value: Decimal | float, multiplier: int = 0, maxBars: int | None = None
+    ) -> ValueBars:
+        """
+        Aggregate the ticks into bars of at least ``dollar_value`` each: a bar
+        completes with the tick that brings it to ``dollar_value``, which can
+        take it past (a tick is not split).
+
+        Dollar value means the sum of price × size, so a bar's dollar value is the total money traded in it. 
+        A bar with no tick has no dollar value; without a previous close (no tick yet) there is no bar. Ticks without a price (a midpoint without a bid and ask) are skipped.
+
+        Emits each completed :class:`~ib_async.objects.RealTimeBar`; see
+        :class:`BarList` for ``bars`` and its ``updateEvent``.
+
+        Args:
+            dollar_value: The dollar value of a bar.
+            multiplier: The multiplier for the contract.
+            maxBars: Keep at most this many completed bars in ``bars``,
+                besides the one in progress, dropping the oldest; all of
+                them by default.
+        """
+        return ValueBars(dollar_value, multiplier, self, maxBars)
+
+    def rangebars(
+        self, range: Decimal | float, maxBars: int | None = None
+    ) -> RangeBars:
+        """
+        Aggregate the ticks into bars of max ``range`` in basis points each: a bar
+        completes with the tick that brings it to a basis point ``range`` size, which can
+        take it past (a tick is not split).
+
+        Emits each completed :class:`~ib_async.objects.RealTimeBar`; see
+        :class:`BarList` for ``bars`` and its ``updateEvent``.
+
+        Args:
+            range: The range of a bar in basis points.
+            maxBars: Keep at most this many completed bars in ``bars``,
+                besides the one in progress, dropping the oldest; all of
+                them by default.
+        """
+        return RangeBars(range, self, maxBars)
+
 @event_class
 class Midpoints(Tickfilter):
     def on_source(self, ticker: Ticker[EmptyT]) -> None:
@@ -843,3 +885,45 @@ class VolumeBars(_Bars):
 
     def _isComplete(self, builder: _BarBuilder) -> bool:
         return builder.volume >= self._volume
+
+
+@event_class
+class ValueBars(_Bars):
+    __doc__ = Tickfilter.valuebars.__doc__
+
+    _dollar_value: Decimal = Decimal(0)
+    _multiplier: Decimal = Decimal(1)
+
+    def __init__(
+        self, dollar_value: Decimal | float, multiplier: int = 0, source=None, maxBars: int | None = None
+    ):
+        positive = _positiveVolume(dollar_value)
+        if positive is None:
+            raise ValueError(f"a value bar has a positive basis point value, not {dollar_value!r}")
+        self._dollar_value = positive
+        self._multiplier = Decimal(multiplier)
+        _Bars.__init__(self, source, maxBars)
+
+    def _isComplete(self, builder: _BarBuilder) -> bool:
+        return builder.priceVolume * self._multiplier >= self._dollar_value
+
+
+@event_class
+class RangeBars(_Bars):
+    __doc__ = Tickfilter.rangebars.__doc__
+
+    _basis_point_range: Decimal = Decimal(0)
+
+    def __init__(
+        self, range: Decimal | float, source=None, maxBars: int | None = None
+    ):
+        positive = _positiveVolume(range)
+        if positive is None:
+            raise ValueError(f"a range bar has a positive range, not {range!r}")
+        self._basis_point_range = positive
+        _Bars.__init__(self, source, maxBars)
+
+    def _isComplete(self, builder: _BarBuilder) -> bool:
+        _max_bar_size = (builder.open * self._basis_point_range) / Decimal(10000.0)
+        return (builder.high - builder.low) >= _max_bar_size
+
