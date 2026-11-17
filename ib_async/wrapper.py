@@ -84,6 +84,7 @@ from ib_async.objects import (
 )
 from ib_async.order import Order, OrderState, OrderStatus, Trade
 from ib_async.runtime import Tally
+from ib_async.streams import Stream
 from ib_async.ticker import HaltedStatus, Ticker
 from ib_async.util import (
     UNSET_DOUBLE,
@@ -283,6 +284,9 @@ class RequestError(Exception):
 # 399 - Order message error
 # 404 -	Shares for this order are not immediately available for short sale. The order will be held while we attempt to locate the shares.
 # 434 -	The order size cannot be zero.
+# 481 - Order size was reduced. IBKR support says the order is not rejected; it
+#       can mean IBKR has no shares to borrow for a short sale
+#       (https://dimon.ca/dmitrys-tws-api-faq/).
 # 492 - ? not listed
 # 10167 ? not listed
 # 10349 - Warning about "Order TIF was set to DAY based on order preset" but does NOT cancel active order
@@ -345,6 +349,7 @@ _WARNING_CODES: Final[frozenset[int]] = frozenset(
         399,
         404,
         434,
+        481,
         492,
         1100,
         1101,
@@ -458,6 +463,10 @@ class Wrapper(Generic[EmptyT]):
     _liveExecIds: set[str] = field(init=False)
     """Executions already emitted through the live event surface."""
 
+    _fillsAwaitingTrade: dict[int, list[str]] = field(init=False)
+    """Live executions that arrived before their order had a Trade, by
+    permId. The Trade takes them in, with their events, when it appears."""
+
     # commissionReport callbacks usually arrive AFTER their paired
     # execDetails, but mid-connection races (especially across cross-client
     # fills replayed at startup) can deliver the report first. Park the
@@ -534,6 +543,7 @@ class Wrapper(Generic[EmptyT]):
         self.permId2Trade = {}
         self.fills = {}
         self._liveExecIds = set()
+        self._fillsAwaitingTrade = {}
         self._pendingCommissionReports = OrderedDict()
         self.newsTicks = []
         self.msgId2NewsBulletin = {}
@@ -631,8 +641,12 @@ class Wrapper(Generic[EmptyT]):
     def _normalizeDatetime(self, value: date_) -> date_: ...
 
     def _normalizeDatetime(self, value: datetime | date_) -> datetime | date_:
-        """Convert a datetime to the configured default time zone. A date
-        has no time zone, so it is returned unchanged."""
+        """A time TWS sent, shown in the default time zone.
+
+        The one rule for every time TWS sends. A time with a zone is that
+        instant. A time without one is a wall clock in TWS's own zone:
+        ``TimezoneTWS``, or the default time zone when that is unset. A date
+        has no time zone and is returned unchanged."""
         if not isinstance(value, datetime):
             return value
 
@@ -994,6 +1008,7 @@ class Wrapper(Generic[EmptyT]):
                 self.requests.append(SingletonKey("openOrders"), trade)
             else:
                 self.ib.openOrderEvent.emit(trade)
+            self._takeInEarlierFills(trade)
 
         # make sure that the client issues order ids larger than any
         # order id encountered (even from other clients) to avoid
@@ -1066,6 +1081,7 @@ class Wrapper(Generic[EmptyT]):
         # wave after completedOrdersEnd already fired), instead of the
         # KeyError the legacy direct-index access used to raise.
         self.requests.append(SingletonKey("completedOrders"), trade)
+        self._takeInEarlierFills(trade)
 
     def completedOrdersEnd(self):
         self.requests.set_result(SingletonKey("completedOrders"))
@@ -1206,9 +1222,42 @@ class Wrapper(Generic[EmptyT]):
                 if parkedReport is not None:
                     self.ib.commissionReportEvent.emit(trade, fill, parkedReport)
                     trade.commissionReportEvent.emit(trade, fill, parkedReport)
+        elif isLive and execId not in self._liveExecIds:
+            # No Trade yet: a fill can come before its order's openOrder,
+            # and a master client may not have seen another client's order.
+            # The Trade takes the fill in when it appears.
+            waiting = self._fillsAwaitingTrade.setdefault(execution.permId, [])
+            if execId not in waiting:
+                waiting.append(execId)
 
         if not isLive:
             self.requests.append(ReqIdKey(reqId), fill)
+
+    def _takeInEarlierFills(self, trade: Trade) -> None:
+        """Attach the live fills that arrived before ``trade`` existed, and
+        fire the events they could not fire then, once each: the
+        execution, and the commission report if it came too."""
+        for execId in self._fillsAwaitingTrade.pop(trade.order.permId, []):
+            fill = self.fills[execId]
+            if execId in self._liveExecIds or fill in trade.fills:
+                continue
+            trade.fills.append(fill)
+            execution = fill.execution
+            trade.log.append(
+                TradeLogEntry(
+                    fill.time,
+                    trade.orderStatus.status,
+                    f"Fill {execution.shares}@{execution.price}",
+                )
+            )
+            self._liveExecIds.add(execId)
+            self._logger.info("execDetails: %s", fill)
+            self.ib.execDetailsEvent.emit(trade, fill)
+            trade.fillEvent.emit(trade, fill)
+            report = fill.commissionReport
+            if report.execId == execId:
+                self.ib.commissionReportEvent.emit(trade, fill, report)
+                trade.commissionReportEvent.emit(trade, fill, report)
 
     def execDetailsEnd(self, reqId: int):
         self.requests.set_result(ReqIdKey(reqId))
@@ -2090,7 +2139,9 @@ class Wrapper(Generic[EmptyT]):
                 "historicalNews: unreadable time %r for article %s", time, articleId
             )
             return
-        article = HistoricalNews(dt, providerCode, articleId, headline)
+        article = HistoricalNews(
+            self._normalizeDatetime(dt), providerCode, articleId, headline
+        )
         self.requests.append(ReqIdKey(reqId), article)
 
     def historicalNewsEnd(self, reqId, _hasMore: bool):
@@ -2128,10 +2179,21 @@ class Wrapper(Generic[EmptyT]):
         self.requests.set_result(SingletonKey("currentTimeInMillis"), timeInMillis)
 
     def rerouteMktDataReq(self, reqId: int, conId: int, exchange: str):
-        self.ib.rerouteMktDataReqEvent.emit(reqId, conId, exchange)
+        if (stream := self._streamFor(reqId, "rerouteMktDataReq")) is not None:
+            self.ib.rerouteMktDataReqEvent.emit(stream, conId, exchange)
 
     def rerouteMktDepthReq(self, reqId: int, conId: int, exchange: str):
-        self.ib.rerouteMktDepthReqEvent.emit(reqId, conId, exchange)
+        if (stream := self._streamFor(reqId, "rerouteMktDepthReq")) is not None:
+            self.ib.rerouteMktDepthReqEvent.emit(stream, conId, exchange)
+
+    def _streamFor(self, reqId: int, callback: str) -> Stream | None:
+        """The live stream ``reqId`` names, or None (logged) for a stream
+        that already ended."""
+        sub = self.subscriptions.get_sub(reqId)
+        if sub is None:
+            self._logger.warning("%s: no live stream for reqId %s", callback, reqId)
+            return None
+        return sub.stream()
 
     def tickEFP(
         self,
@@ -2228,6 +2290,10 @@ class Wrapper(Generic[EmptyT]):
             # the rest of the function only acts on live orders.
             if trade and trade.isDone():
                 trade = None
+        # The stream this error is about, as it is now: an error below may
+        # end it, and streamErrorEvent still names it.
+        streamSub = self.subscriptions.get_sub(reqId) if reqId != -1 else None
+        stream = None if streamSub is None else streamSub.stream()
         isRequest = inflightRequest is not None
 
         isWarning = errorCode in _WARNING_CODES or 2100 <= errorCode < 2200
@@ -2417,7 +2483,11 @@ class Wrapper(Generic[EmptyT]):
                 self.tally.subscriptionsRefused += 1
                 sub.close(send_cancel=False)
 
+        # Read before errorEvent: a handler there may cancel the stream.
+        ended = streamSub is not None and streamSub.closed
         self.ib.errorEvent.emit(reqId, errorCode, errorString, contract)
+        if stream is not None:
+            self.ib.streamErrorEvent.emit(stream, errorCode, errorString, ended)
 
     def _refilled(
         self, bars: BarDataList, refill: asyncio.Future[BarDataList | None]

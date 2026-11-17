@@ -7,6 +7,7 @@ import contextlib
 import copy
 import dataclasses
 import datetime
+import functools
 import logging
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import Flag, auto
 from operator import attrgetter
-from typing import Any, Generic, Self, overload
+from typing import TYPE_CHECKING, Any, Generic, Self, overload
 
 from eventkit import Event
 
@@ -36,7 +37,6 @@ from ib_async._subscriptions import (
     PnLSub,
     RealTimeBarsSub,
     ScannerSub,
-    Subscription,
     TickByTickSub,
 )
 from ib_async.client import Client
@@ -95,8 +95,12 @@ from ib_async.order import (
 )
 from ib_async.ordertypes import LimitOrder, StopOrder
 from ib_async.runtime import RuntimeState
+from ib_async.streams import Stream
 from ib_async.ticker import Ticker
-from ib_async.wrapper import Wrapper
+from ib_async.wrapper import RequestError, Wrapper
+
+if TYPE_CHECKING:
+    from ib_async._pb.ConfigResponse_pb2 import ConfigResponse
 
 
 def _tagValueList(options: Sequence[TagValue]) -> list[TagValue]:
@@ -116,6 +120,9 @@ class StartupFetch(Flag):
 
 
 StartupFetchNONE = StartupFetch(0)
+
+# A request connect sends at startup, as the call that sends it.
+_StartupRequest = Callable[[], Awaitable[list[Position] | list[Trade] | None]]
 
 StartupFetchALL = (
     StartupFetch.POSITIONS
@@ -261,8 +268,12 @@ class IB(Generic[EmptyT]):
           * :data:`True`: Raise a :class:`.RequestError`.
         MaxSyncedSubAccounts (int): Do not use sub-account updates
           if the number of sub-accounts exceeds this number (50 by default).
-        TimezoneTWS (str): Specifies what timezone TWS (or gateway)
-          is using. The default is to assume local system timezone.
+        TimezoneTWS (str): The time zone TWS (or the gateway) is set to,
+          such as ``"US/Eastern"``. TWS sends some times without a zone, as
+          a wall clock in its own zone; they are read in this zone, or in
+          the default time zone (``IBDefaults.timezone``) when it is empty.
+          Times sent with a zone, or in the hyphenated UTC form, do not use
+          it. Every time is then shown in the default time zone.
 
     Events:
         * ``connectedEvent`` ():
@@ -330,11 +341,13 @@ class IB(Generic[EmptyT]):
         * ``newsBulletinEvent`` (bulletin: :class:`.NewsBulletin`):
           Emit a new news bulletin.
 
-        * ``rerouteMktDataReqEvent`` (reqId: int, conId: int, exchange: str):
-          Emits when IBKR reroutes a market data request to another contract.
+        * ``rerouteMktDataReqEvent`` (stream: :class:`.Stream`, conId: int,
+          exchange: str):
+          Emits when IBKR reroutes a market data stream to another contract.
 
-        * ``rerouteMktDepthReqEvent`` (reqId: int, conId: int, exchange: str):
-          Emits when IBKR reroutes a market depth request to another contract.
+        * ``rerouteMktDepthReqEvent`` (stream: :class:`.Stream`, conId: int,
+          exchange: str):
+          Emits when IBKR reroutes a market depth stream to another contract.
 
         * ``scannerDataEvent`` (data: :class:`.ScanDataList`):
           Emit data from a scanner subscription.
@@ -352,6 +365,13 @@ class IB(Generic[EmptyT]):
           https://interactivebrokers.github.io/tws-api/message_codes.html)
           together with the contract the error applies to (or None if no
           contract applies).
+
+        * ``streamErrorEvent`` (stream: :class:`.Stream`, errorCode: int,
+          errorString: str, ended: bool):
+          Emits, after ``errorEvent``, for an error or warning about a live
+          stream: the stream as it was when the error arrived, and whether
+          ib_async ended the stream because of it. One contract can carry
+          several streams, which the contract alone does not tell apart.
 
         * ``timeoutEvent`` (idlePeriod: float):
           Is emitted if no data is received for longer than the timeout period
@@ -394,6 +414,7 @@ class IB(Generic[EmptyT]):
         "wshMetaEvent",
         "wshEvent",
         "errorEvent",
+        "streamErrorEvent",
         "timeoutEvent",
         "requestTimeoutEvent",
     )
@@ -457,6 +478,7 @@ class IB(Generic[EmptyT]):
         self.wshMetaEvent = Event("wshMetaEvent")
         self.wshEvent = Event("wshEvent")
         self.errorEvent = Event("errorEvent")
+        self.streamErrorEvent = Event("streamErrorEvent")
         self.timeoutEvent = Event("timeoutEvent")
         self.requestTimeoutEvent = Event("requestTimeoutEvent")
 
@@ -527,6 +549,11 @@ class IB(Generic[EmptyT]):
               for member details. There is also StartupFetchNONE and StartupFetchALL
               as shorthand. Individual flag field members can be added or removed
               to the ``fetchFields`` parameter as needed.
+
+        Open orders: connect reads the master client ID configured in TWS.
+        If ``clientId`` matches it, connect loads every API client's open
+        orders, since TWS also sends this client their updates. Otherwise
+        it loads only its own.
         """
         return self._run(
             self.connectAsync(
@@ -949,18 +976,6 @@ class IB(Generic[EmptyT]):
             and (not conId or sub.conId == conId)
         ]
 
-    def subscriptionForReqId(self, reqId: int) -> Subscription | None:
-        """Return the live :class:`Subscription` owning ``reqId``, or ``None``.
-
-        The reqId space is shared by orders and by every data request, so an
-        API error carrying a reqId is ambiguous on its own. This is the
-        public answer to "is this id one of my live data streams?" —
-        :meth:`tradeForOrderId` answers the order half. Together they let a
-        caller classify an ``errorEvent`` correctly instead of guessing from
-        the numeric value.
-        """
-        return self.wrapper.subscriptions.get_sub(reqId)
-
     def tradeForOrderId(self, orderId: int) -> Trade | None:
         """Return this client's :class:`Trade` for ``orderId``, or ``None``.
 
@@ -1035,14 +1050,30 @@ class IB(Generic[EmptyT]):
         )
         return result
 
-    def subscriptions(self) -> list[Subscription]:
-        """List of every live :class:`Subscription` (market data,
-        tick-by-tick, market depth, realtime / historical bars,
-        scanner, PnL). Replaces the pre-refactor ``IB.subscribers()``
-        accessor; iteration is over the
-        :class:`~ib_async._subscriptions.SubscriptionRegistry`.
-        """
-        return list(self.wrapper.subscriptions)
+    def streams(self, contract: Contract | None = None) -> dict[int, Stream]:
+        """Every live stream (market data, snapshots, tick-by-tick, market
+        depth, real-time and kept-up-to-date bars, scanners, PnL), keyed by
+        the reqId IBKR knows it by. Each is its own
+        :mod:`ib_async.streams` type.
+
+        With ``contract``, only the streams on that instrument, matched as
+        market data is: by conId, a bag by its legs, an unqualified
+        contract by its fields. Any Contract object for the instrument
+        finds them, such as ``ticker.contract`` or a fresh one."""
+        return self.wrapper.subscriptions.streams(contract)
+
+    def stream(self, reqId: int) -> Stream | None:
+        """The live :class:`.Stream` IBKR knows by ``reqId``, or None.
+
+        For code that handles raw wrapper callbacks, which carry only a
+        reqId, and for matching TWS's API log. Orders share the id space:
+        :meth:`tradeForOrderId` answers for an order. A stream sent again under a
+        new reqId (after a bust event) is found under the new one, so look
+        it up rather than keeping the reqId. An error that ends a stream
+        removes it before ``errorEvent`` fires: ``streamErrorEvent`` carries
+        the stream instead."""
+        sub = self.wrapper.subscriptions.get_sub(reqId)
+        return None if sub is None else sub.stream()
 
     def newsTicks(self) -> list[NewsTick]:
         """
@@ -2694,36 +2725,62 @@ class IB(Generic[EmptyT]):
 
     # now entering the parallel async universe
 
+    async def _startupOpenOrdersAsync(self) -> list[Trade]:
+        """The open orders connect loads. If this client's ID is the master
+        client ID configured in TWS, every API client's, since TWS also
+        sends this client their updates. Otherwise only this client's: it
+        gets no updates for other clients' orders, so a Trade for one would
+        never change. A config TWS refuses counts as no match."""
+        try:
+            config = await self.reqConfigAsync()
+        except RequestError as error:
+            self._logger.warning("TWS refused its config: %s", error)
+            config = None
+        settings = config.api.settings if config is not None else None
+        master = (
+            settings is not None
+            and settings.HasField("masterClientId")
+            and settings.masterClientId == self.wrapper.clientId
+        )
+        if master:
+            return await self.reqAllOpenOrdersAsync()
+        return await self.reqOpenOrdersAsync()
+
     def _startupRequests(
         self,
         fetchFields: StartupFetch,
         readonly: bool,
         account: str,
         accounts: list[str],
-    ) -> dict[str, Awaitable[list[Position] | list[Trade] | None]]:
-        """Return the requests connect sends to sync state, by name.
+    ) -> dict[str, _StartupRequest]:
+        """Return the requests connect sends to sync state, by name, each
+        as the call that sends it. Nothing is sent here.
 
         Only requests selected by ``fetchFields`` are included."""
-        reqs: dict[str, Awaitable[list[Position] | list[Trade] | None]] = {}
+        reqs: dict[str, _StartupRequest] = {}
         if fetchFields & StartupFetch.POSITIONS:
-            reqs["positions"] = self.reqPositionsAsync()
+            reqs["positions"] = self.reqPositionsAsync
         if not readonly and fetchFields & StartupFetch.ORDERS_OPEN:
-            reqs["open orders"] = self.reqOpenOrdersAsync()
+            reqs["open orders"] = self._startupOpenOrdersAsync
         if (
             not readonly
             and self.client.serverVersion() >= 150
             and fetchFields & StartupFetch.ORDERS_COMPLETE
         ):
-            reqs["completed orders"] = self.reqCompletedOrdersAsync(False)
+            reqs["completed orders"] = functools.partial(
+                self.reqCompletedOrdersAsync, False
+            )
         if account and fetchFields & StartupFetch.ACCOUNT_UPDATES:
-            reqs["account updates"] = self.reqAccountUpdatesAsync(account)
+            reqs["account updates"] = functools.partial(
+                self.reqAccountUpdatesAsync, account
+            )
         if (
             len(accounts) <= self.MaxSyncedSubAccounts
             and fetchFields & StartupFetch.SUB_ACCOUNT_UPDATES
         ):
             for acc in accounts:
-                reqs[f"account updates for {acc}"] = self.reqAccountUpdatesMultiAsync(
-                    acc
+                reqs[f"account updates for {acc}"] = functools.partial(
+                    self.reqAccountUpdatesMultiAsync, acc
                 )
         return reqs
 
@@ -2756,7 +2813,7 @@ class IB(Generic[EmptyT]):
             reqs = self._startupRequests(fetchFields, readonly, account, accounts)
 
             # run initializing requests concurrently and log if any times out
-            tasks = [asyncio.wait_for(req, timeout) for req in reqs.values()]
+            tasks = [asyncio.wait_for(send(), timeout) for send in reqs.values()]
             errors = []
             resps = await asyncio.gather(*tasks, return_exceptions=True)
             for name, resp in zip(reqs, resps, strict=True):
@@ -3571,12 +3628,12 @@ class IB(Generic[EmptyT]):
         """Unsubscribe from TWS display-group event stream."""
         self.client.unsubscribeFromGroupEvents(reqId)
 
-    def reqConfigAsync(self) -> Awaitable:
+    def reqConfigAsync(self) -> Awaitable[ConfigResponse | None]:
         """Fetch the TWS / IB Gateway runtime config. Protobuf-only —
         server >= 219 (MIN_SERVER_VER_CONFIG). The future settles with
         the raw ``ConfigResponse`` proto carrying nested
         LockAndExitConfig / ApiConfig / MessageConfig / OrdersConfig
-        sub-messages."""
+        sub-messages, or None when TWS refuses the request."""
         with self._reqIdRequest() as opened:
             self.client.reqConfig(opened.reqId)
         return opened.future

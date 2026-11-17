@@ -55,6 +55,25 @@ The full upgrade guide with examples lives at ``docs/migration/v3.md``.
   * ``IB.cancelHistoricalTicks`` (protobuf-only, server >= 215; settles awaiter)
   * ``IB.reqConfigAsync``, ``IB.updateConfigAsync`` (protobuf-only, server >= 219)
 
+* **Streams.** Every live stream is a read-only ``Stream`` of its own type
+  in ``ib_async.streams``, with its ``reqId`` and exactly the data it has:
+  ``MarketDataStream``, ``SnapshotStream``, ``TickByTickStream`` and
+  ``MarketDepthStream`` (``TickerStream``\ s, with ``contract`` and
+  ``ticker``), ``RealTimeBarsStream`` and ``HistoricalBarsStream`` (with
+  ``bars``), ``ScannerStream``, ``PnLStream`` and ``PnLSingleStream``
+  (with ``account`` and ``modelCode``). ``ContractStream`` groups the ones
+  on an instrument. ``IB.streams()`` maps each live reqId to its Stream,
+  ``IB.streams(contract)`` those on one instrument (by conId, a bag by its
+  legs, so any Contract object for it works), and ``IB.stream(reqId)``
+  finds one; they replace ``Wrapper.reqId2Ticker``
+  and ``ticker2ReqId`` from v2.x, and the unreleased
+  ``IB.subscriptions()`` and ``IB.subscriptionForReqId()``.
+  ``IB.streamErrorEvent(stream, errorCode, errorString, ended)`` fires
+  after ``errorEvent`` for an error about a live stream, with the stream
+  as it was and whether ib_async ended it, so a handler can tell apart
+  the streams on one contract. ``rerouteMktDataReqEvent`` and
+  ``rerouteMktDepthReqEvent`` carry ``(stream, conId, exchange)``.
+  (:issue:`247`, thanks to @wentbackward)
 * **``IB.connect`` and ``connectAsync`` are annotated ``-> Self``**, so
   ``ib = IB().connect(...)`` type-checks. (:issue:`215`, thanks to
   @jchaffraix)
@@ -204,6 +223,19 @@ The full upgrade guide with examples lives at ``docs/migration/v3.md``.
   ``PnLSingle``. ``None`` is the unset sentinel —
   ``Decimal('NaN')`` is never used (it is silently truthy in Python
   and corrupted downstream comparisons).
+* **One rule for every time TWS sends.** A time with a zone, or in the
+  hyphenated UTC form, is that instant. A time without a zone is a wall
+  clock in ``TimezoneTWS``, or in the default time zone
+  (``IBDefaults.timezone``) when ``TimezoneTWS`` is unset; the host's zone
+  no longer counts. Every result is shown in the default time zone. Bars
+  and head timestamps already worked this way. Execution times in the
+  zone-less ``YYYYmmdd  HH:MM:SS`` form were read in the host's zone and
+  now follow the rule. Historical news times were returned as parsed, in
+  the zone they named or naive; they are now shown in the default time
+  zone like every other time, and a zone-less one follows the rule. A
+  trailing ``Z`` after the time, with or without a space, marks UTC
+  (``20260824-20:00:12Z``); a time without it parses as before.
+  (:issue:`230`, :issue:`181`)
 * **``IBC`` needs ``twsVersion``**: it has no default, so ``IBC()``
   raises ``TypeError``; pass it first, ``IBC(1019)`` or ``IBC("10.19")``
   (see Fixed). IBC's start script could not run without it.
@@ -347,6 +379,28 @@ The full upgrade guide with examples lives at ``docs/migration/v3.md``.
 These were broken on v2.x against modern TWS / Gateway versions and
 are fixed in v3.0:
 
+* **Importing failed for a version with a label.** ``__version_info__``
+  called ``int()`` on every part of the installed version, so a
+  pre-release, post-release, dev or local version such as ``3.0.0rc1`` or
+  ``3.0.0+local.1`` raised ``ValueError`` at import. ``__version_info__`` is
+  now the release segment as integers, ``(3, 0, 0)`` for each of those;
+  ``__version__`` keeps the whole version. (:issue:`245`, thanks to
+  @Lcstyle)
+* **Generated bindings failed to import on Windows.**
+  ``scripts/generate_protos.py`` wrote ``ib_async/_pb/__init__.py`` in
+  the locale's code page, which on Windows is not UTF-8, so the first
+  ``import ib_async`` raised ``SyntaxError``. The scripts now read and
+  write every text file as UTF-8. (:issue:`246`, thanks to @yahiaaktham)
+* **The master client missed other clients' fills.** ib_async now reads
+  the master client ID configured in TWS. When the connecting client ID
+  matches it, connect loads every API client's open orders instead of
+  only its own, so fills of other clients' orders fire
+  ``execDetailsEvent`` and ``commissionReportEvent``, also after a
+  reconnect. Before, the master client had no Trade for orders other
+  clients already had working, and their fills reached ``ib.fills()``
+  with no event. A fill that arrives before its order's openOrder now
+  fires its events once the order appears. (:issue:`244`, thanks to
+  @Lcstyle)
 * **A refused modification marked a live order Cancelled.** TWS reports a
   refused modification as an error and sends no status, and the order
   keeps working on its old terms. The trade became ``Cancelled``, fired
@@ -358,7 +412,9 @@ are fixed in v3.0:
   so this holds for the rest of the order's life. The trade stays active
   as ``ValidationError`` until its next status. A status that ends the
   order still ends the trade, and ``Cancelled`` or ``Inactive`` then fires
-  ``cancelledEvent``. (:issue:`243`, thanks to @nealeyoung)
+  ``cancelledEvent``. Error 481 (Order size was reduced) is now a warning
+  for every order, because IBKR does not reject the order with it.
+  (:issue:`243`, thanks to @nealeyoung)
 * **A repeated commission report fired its events twice.** TWS repeats
   an execution and its commission report, for instance after a
   reconnect. The repeated execution was already ignored. The repeated
@@ -753,12 +809,14 @@ no behavioural change to the public API.
 
 **Changed**
 
-* **Internal architecture refactor (no public API change)**: ten
+* **Internal architecture refactor**: ten
   parallel mutable dicts on ``Wrapper`` (``_futures``, ``_results``,
   ``_reqId2Contract``, ``reqId2Ticker``, ``ticker2ReqId``,
   ``reqId2Subscriber``, ``reqId2PnL``, ``reqId2PnlSingle``,
   ``pnlKey2ReqId``, ``pnlSingleKey2ReqId``) replaced with two typed
-  registries plus eight self-managing ``Subscription`` types:
+  registries plus eight self-managing ``Subscription`` types. The public
+  ``reqId2Ticker`` and ``ticker2ReqId`` went with them; in 3.0,
+  ``IB.streams()`` and ``IB.stream(reqId)`` replace them:
 
   * ``RequestRegistry`` owns every in-flight one-shot / singleton
     request. Discriminated key types (``ReqIdKey``,
