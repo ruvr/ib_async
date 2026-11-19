@@ -74,6 +74,14 @@ The full upgrade guide with examples lives at ``docs/migration/v3.md``.
   the streams on one contract. ``rerouteMktDataReqEvent`` and
   ``rerouteMktDepthReqEvent`` carry ``(stream, conId, exchange)``.
   (:issue:`247`, thanks to @wentbackward)
+* **``IB.qualifyContractDetails``** (and ``qualifyContractDetailsAsync``)
+  qualifies contracts in place, as ``qualifyContracts`` does, and returns
+  the ``ContractDetails`` each was qualified from, whose ``contract`` is
+  the given contract; None for an unknown or ambiguous one. One request per
+  contract gives both, and both methods pick the details by one rule.
+  ``qualifyContracts`` is annotated and documented as returning one entry
+  per contract, None where qualifying failed. (:issue:`250`, thanks to
+  @PhilipReschke)
 * **``IB.connect`` and ``connectAsync`` are annotated ``-> Self``**, so
   ``ib = IB().connect(...)`` type-checks. (:issue:`215`, thanks to
   @jchaffraix)
@@ -379,6 +387,12 @@ The full upgrade guide with examples lives at ``docs/migration/v3.md``.
 These were broken on v2.x against modern TWS / Gateway versions and
 are fixed in v3.0:
 
+* **Dividends of 1,000 or more were lost.** IBKR's dividend tick separates
+  its fields with commas and also groups a number's thousands with them,
+  so ``',1,089.45,20261116,2.199'`` split into five fields, was logged as
+  malformed, and left ``Ticker.dividends`` unchanged. Each field is now
+  read by its shape, anchored on the 8-digit date. (:issue:`249`, thanks to
+  @PhilipReschke)
 * **Importing failed for a version with a label.** ``__version_info__``
   called ``int()`` on every part of the installed version, so a
   pre-release, post-release, dev or local version such as ``3.0.0rc1`` or
